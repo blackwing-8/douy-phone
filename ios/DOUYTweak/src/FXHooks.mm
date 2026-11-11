@@ -104,6 +104,12 @@ static CMSampleBufferRef FXCreateVideoSampleBuffer(CVPixelBufferRef pixelBuffer,
         return NULL;
     }
 
+    if (!CMTIME_IS_VALID(duration) || CMTIME_IS_INDEFINITE(duration) ||
+        CMTIME_COMPARE_INLINE(duration, <=, kCMTimeZero))
+    {
+        duration = CMTimeMake(1, 30);   // 时长缺失时给个合理值，避免 VT 侧异常
+    }
+
     CMSampleTimingInfo timing = { duration, pts, kCMTimeInvalid };
     CMSampleBufferRef sample = NULL;
     OSStatus status = CMSampleBufferCreateReadyWithImageBuffer(kCFAllocatorDefault,
@@ -421,6 +427,74 @@ static CMSampleBufferRef FXMakeReplacementAudioSample(CMSampleBufferRef original
 static char kFXVideoProxyKey;
 static char kFXAudioProxyKey;
 
+// ─────────────── 崩溃防御 ───────────────
+// 替换链路里任何一步不可靠时，都必须把「原始样本」原样交给宿主，绝不能让宿主崩。
+
+static volatile int FXVideoReplaceFailures = 0;
+static volatile int FXAudioReplaceFailures = 0;
+
+/// 安全模式：在 App 里执行 defaults write <bundle> FXSafeMode -bool YES 即可完全关闭替换（只做转发）
+static BOOL FXSafeModeEnabled(void)
+{
+    return [[NSUserDefaults standardUserDefaults] boolForKey:@"FXSafeMode"];
+}
+
+/// 把替换帧交给宿主前的最后一道校验：尺寸/格式/时间戳任何一项对不上就放弃替换
+static BOOL FXVideoSampleLooksValid(CMSampleBufferRef sample)
+{
+    if (sample == NULL || !CMSampleBufferIsValid(sample))
+    {
+        return NO;
+    }
+    if (CMSampleBufferGetNumSamples(sample) < 1)
+    {
+        return NO;
+    }
+    CVImageBufferRef image = CMSampleBufferGetImageBuffer(sample);
+    if (image == NULL)
+    {
+        return NO;
+    }
+    CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sample);
+    if (format == NULL)
+    {
+        return NO;
+    }
+    CMVideoDimensions dim = CMVideoFormatDescriptionGetDimensions(format);
+    if (dim.width <= 0 || dim.height <= 0)
+    {
+        return NO;
+    }
+    if ((size_t)dim.width != CVPixelBufferGetWidth(image) ||
+        (size_t)dim.height != CVPixelBufferGetHeight(image))
+    {
+        return NO;
+    }
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sample);
+    if (!CMTIME_IS_VALID(pts))
+    {
+        return NO;
+    }
+    return YES;
+}
+
+static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
+{
+    if (sample == NULL || !CMSampleBufferIsValid(sample))
+    {
+        return NO;
+    }
+    if (CMSampleBufferGetNumSamples(sample) < 1)
+    {
+        return NO;
+    }
+    if (CMSampleBufferGetFormatDescription(sample) == NULL)
+    {
+        return NO;
+    }
+    return YES;
+}
+
 @implementation FXVideoDelegateProxy
 
 - (void)captureOutput:(AVCaptureOutput *)output
@@ -433,7 +507,31 @@ static char kFXAudioProxyKey;
         return;
     }
 
-    CMSampleBufferRef replacement = FXMakeReplacementVideoSample(sampleBuffer, output);
+    CMSampleBufferRef replacement = NULL;
+
+    // 安全模式或连续失败 5 次后：只转发原帧，绝不再碰替换链路
+    if (!FXSafeModeEnabled() && FXVideoReplaceFailures < 5)
+    {
+        @try
+        {
+            replacement = FXMakeReplacementVideoSample(sampleBuffer, output);
+        }
+        @catch (NSException *exception)
+        {
+            __sync_add_and_fetch(&FXVideoReplaceFailures, 1);
+            NSLog(@"[DOUY] 视频替换抛异常，回退原帧: %@", exception);
+            replacement = NULL;
+        }
+
+        if (replacement != NULL && !FXVideoSampleLooksValid(replacement))
+        {
+            __sync_add_and_fetch(&FXVideoReplaceFailures, 1);
+            NSLog(@"[DOUY] 替换帧校验未通过，回退原帧（第 %d 次）", FXVideoReplaceFailures);
+            CFRelease(replacement);
+            replacement = NULL;
+        }
+    }
+
     [target captureOutput:output
         didOutputSampleBuffer:(replacement ?: sampleBuffer)
                fromConnection:connection];
@@ -485,7 +583,28 @@ static char kFXAudioProxyKey;
         return;
     }
 
-    CMSampleBufferRef replacement = FXMakeReplacementAudioSample(sampleBuffer);
+    CMSampleBufferRef replacement = NULL;
+    if (!FXSafeModeEnabled() && FXAudioReplaceFailures < 5)
+    {
+        @try
+        {
+            replacement = FXMakeReplacementAudioSample(sampleBuffer);
+        }
+        @catch (NSException *exception)
+        {
+            __sync_add_and_fetch(&FXAudioReplaceFailures, 1);
+            NSLog(@"[DOUY] 音频替换抛异常，回退原帧: %@", exception);
+            replacement = NULL;
+        }
+
+        if (replacement != NULL && !FXAudioSampleLooksValid(replacement))
+        {
+            __sync_add_and_fetch(&FXAudioReplaceFailures, 1);
+            CFRelease(replacement);
+            replacement = NULL;
+        }
+    }
+
     [target captureOutput:output
         didOutputSampleBuffer:(replacement ?: sampleBuffer)
                fromConnection:connection];
