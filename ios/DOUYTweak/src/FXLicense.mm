@@ -42,6 +42,38 @@ static NSString *FXCurrentServerPublicKey(void)
     }
     return kFXServerPublicKeyECDSA;
 }
+
+/*
+ * iOS 的 SecKeyCreateWithData 对 EC 公钥只接受 X9.63 裸点（04 || X || Y，共 65 字节），
+ * 而服务端 key:gen 输出的是 SPKI(DER) 的 base64。直接拿 DER 去建 key 会失败，
+ * 表现为「激活成功但一操作就授权失败」。这里统一转成裸点。
+ */
+static NSData *FXServerKeyDataFromBase64(NSString *base64)
+{
+    NSData *raw = [[NSData alloc] initWithBase64EncodedString:(base64 ?: @"") options:0];
+    if (raw.length == 0)
+    {
+        return nil;
+    }
+
+    const uint8_t *bytes = (const uint8_t *)raw.bytes;
+
+    if (raw.length == 65 && bytes[0] == 0x04)
+    {
+        return raw;   // 已经是裸点
+    }
+
+    if (raw.length > 65)
+    {
+        NSUInteger offset = raw.length - 65;
+        if (bytes[offset] == 0x04)
+        {
+            return [raw subdataWithRange:NSMakeRange(offset, 65)];   // SPKI 末尾就是裸点
+        }
+    }
+
+    return nil;
+}
 static NSString *const kFXProofVersion = @"douy-ios-proof-v1";
 static NSString *const kFXKeychainService = @"app.douy.plugin-auth";
 static NSString *const kFXDeviceTag = @"app.douy.plugin.device-key.v1";
@@ -664,9 +696,10 @@ static NSData *FXSignWithDeviceKey(SecKeyRef key, NSData *data)
 
     if (_serverKey == NULL)
     {
-        NSData *der = [[NSData alloc] initWithBase64EncodedString:keyB64 options:0];
+        NSData *der = FXServerKeyDataFromBase64(keyB64);
         if (der.length == 0)
         {
+            NSLog(@"[DOUY] 服务端公钥格式无法识别（应为 SPKI 或 65 字节裸点）");
             return NO;
         }
         NSDictionary *attrs = @{
