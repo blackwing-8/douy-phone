@@ -26,6 +26,27 @@ static CIContext *FXSharedCIContext(void)
     return context;
 }
 
+/// 按**指定像素格式**建 buffer（必须与摄像头原始帧一致，否则宿主编码器会崩）
+static CVPixelBufferRef FXCreateBufferWithFormat(size_t width, size_t height, OSType format)
+{
+    if (width == 0 || height == 0)
+    {
+        return NULL;
+    }
+    if (format == 0)
+    {
+        format = kCVPixelFormatType_420YpCbCr8BiPlanarFullRange;
+    }
+
+    NSDictionary *attributes = @{
+        (id)kCVPixelBufferIOSurfacePropertiesKey : @{},
+    };
+    CVPixelBufferRef buffer = NULL;
+    CVReturn status = CVPixelBufferCreate(kCFAllocatorDefault, width, height, format,
+                                          (__bridge CFDictionaryRef)attributes, &buffer);
+    return status == kCVReturnSuccess ? buffer : NULL;
+}
+
 static CVPixelBufferRef FXCreateBufferLike(CVPixelBufferRef like, size_t width, size_t height)
 {
     OSType format = CVPixelBufferGetPixelFormatType(like);
@@ -49,14 +70,14 @@ static CVPixelBufferRef FXCreateBufferLike(CVPixelBufferRef like, size_t width, 
 
 /// 旋转 / 镜像 / 缩放到目标尺寸（只在需要时调用）。
 static CVPixelBufferRef FXTransformBuffer(CVPixelBufferRef source, size_t outWidth, size_t outHeight,
-                                          NSInteger rotation, BOOL mirror)
+                                          OSType outFormat, NSInteger rotation, BOOL mirror)
 {
     if (source == NULL || outWidth == 0 || outHeight == 0)
     {
         return NULL;
     }
 
-    CVPixelBufferRef destination = FXCreateBufferLike(source, outWidth, outHeight);
+    CVPixelBufferRef destination = FXCreateBufferWithFormat(outWidth, outHeight, outFormat);
     if (destination == NULL)
     {
         return NULL;
@@ -143,15 +164,23 @@ static CMSampleBufferRef FXMakeReplacementVideoSample(CMSampleBufferRef original
     size_t decodedWidth = CVPixelBufferGetWidth(decoded);
     size_t decodedHeight = CVPixelBufferGetHeight(decoded);
 
+    // 关键：输出帧的像素格式必须和摄像头原始帧完全一致（420f/420v/BGRA 混用会让宿主编码器崩溃）
+    OSType targetFormat = originalImage ? CVPixelBufferGetPixelFormatType(originalImage) : 0;
+    OSType decodedFormat = CVPixelBufferGetPixelFormatType(decoded);
+    if (targetFormat == 0)
+    {
+        targetFormat = decodedFormat;
+    }
+
     NSInteger rotation = store.rotation;
     BOOL mirror = store.mirror;
     BOOL needsTransform = (rotation % 360) != 0 || mirror || decodedWidth != targetWidth ||
-                          decodedHeight != targetHeight;
+                          decodedHeight != targetHeight || decodedFormat != targetFormat;
 
     CVPixelBufferRef finalBuffer = NULL;
     if (needsTransform)
     {
-        finalBuffer = FXTransformBuffer(decoded, targetWidth, targetHeight, rotation, mirror);
+        finalBuffer = FXTransformBuffer(decoded, targetWidth, targetHeight, targetFormat, rotation, mirror);
     }
     else
     {
@@ -161,6 +190,15 @@ static CMSampleBufferRef FXMakeReplacementVideoSample(CMSampleBufferRef original
     CVPixelBufferRelease(decoded);
     if (finalBuffer == NULL)
     {
+        return NULL;
+    }
+
+    // 兜底：格式仍然不一致就放弃替换，让真实画面过去（宁可没效果，也不能让宿主崩）
+    if (CVPixelBufferGetPixelFormatType(finalBuffer) != targetFormat)
+    {
+        NSLog(@"[DOUY] 替换帧格式不匹配（%u != %u），放弃替换",
+              (unsigned)CVPixelBufferGetPixelFormatType(finalBuffer), (unsigned)targetFormat);
+        CVPixelBufferRelease(finalBuffer);
         return NULL;
     }
 
