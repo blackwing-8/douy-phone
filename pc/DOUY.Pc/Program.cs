@@ -22,6 +22,7 @@ internal static class Program
         }
 
         var command = args.Length > 0 ? args[0].ToLowerInvariant() : "gui";
+        AppLog.Info($"==== DOUY.Pc 启动 · 模式 {command} · 日志 {AppLog.LogFilePath}");
         try
         {
             switch (command)
