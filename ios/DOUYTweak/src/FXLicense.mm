@@ -19,7 +19,7 @@ NSString *const FXLicenseDidChangeNotification = @"FXLicenseDidChangeNotificatio
 // ---- 配置 ----------------------------------------------------------------
 // 授权服务地址（部署后改成你自己的；运行时可用 NSUserDefaults 的
 // FXLicenseBaseURL 覆盖，便于测试）
-static NSString *const kFXDefaultBaseURL = @"https://example.com";
+static NSString *const kFXDefaultBaseURL = @"https://douy.gmai.ws";
 static NSString *const kFXDefaultsBaseURLKey = @"FXLicenseBaseURL";
 
 // 服务端签名公钥（ECDSA P-256，X.509 SPKI 的 base64）。
