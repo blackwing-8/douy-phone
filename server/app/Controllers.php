@@ -124,6 +124,13 @@ class AuthController
                 'UPDATE douy_devices SET public_key = ?, key_id = ?, ios_version = ?, bundle_id = ?, model = ?, last_seen_ms = ? WHERE id = ?',
                 [$publicKey, $keyId, $req->str('ios_version'), $req->str('bundle_id'), $req->str('model'), $now, $existing['id']]
             );
+
+            // 每次启动都刷新一次插件哈希（旧版本换新版时不会被当成篡改）
+            $seenHash = $req->str('module_text_sha256', '');
+            if ($seenHash !== '' && $seenHash !== (string)$existing['module_hash']) {
+                $db->exec('UPDATE douy_devices SET module_hash = ? WHERE id = ?', [$seenHash, $existing['id']]);
+                $db->audit('module_hash_refresh', ['device_id' => $deviceId], ['old' => $existing['module_hash'], 'new' => $seenHash]);
+            }
         }
 
         $device = $db->one('SELECT * FROM douy_devices WHERE device_id = ?', [$deviceId]);
@@ -245,12 +252,19 @@ class LicenseController
         // 防篡改（可选）：与登记时的哈希比对
         $moduleHash = $req->str('module_text_sha256', '');
         if ($moduleHash !== '' && $device !== null) {
+            $strict = !empty($config['license']['strict_module_check']);
             if (empty($device['module_hash'])) {
                 $db->exec('UPDATE douy_devices SET module_hash = ? WHERE id = ?', [$moduleHash, $device['id']]);
+                $device['module_hash'] = $moduleHash;
             } elseif ($device['module_hash'] !== $moduleHash) {
                 $db->audit('module_changed', ['account_id' => $account['id'], 'device_id' => $deviceId],
-                    ['old' => $device['module_hash'], 'new' => $moduleHash]);
-                throw new ApiException('IOS_MODULE_CHANGED', '插件运行代码发生变化，请重新安装官方版本');
+                    ['old' => $device['module_hash'], 'new' => $moduleHash, 'strict' => $strict]);
+                if ($strict) {
+                    throw new ApiException('IOS_MODULE_CHANGED', '插件运行代码发生变化，请重新安装官方版本');
+                }
+                // 非严格模式：视为正常发版/热更新，更新记录后继续（否则每次换版都会把用户锁死）
+                $db->exec('UPDATE douy_devices SET module_hash = ? WHERE id = ?', [$moduleHash, $device['id']]);
+                $device['module_hash'] = $moduleHash;
             }
         }
 
