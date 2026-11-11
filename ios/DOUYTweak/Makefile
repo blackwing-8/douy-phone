@@ -29,7 +29,7 @@ INCLUDES    := -Isrc
 FRAMEWORKS  := -framework Foundation -framework UIKit -framework AVFoundation \
                -framework CoreMedia -framework CoreVideo -framework VideoToolbox \
                -framework AudioToolbox -framework CoreImage -framework CoreGraphics \
-               -framework UniformTypeIdentifiers
+               -framework UniformTypeIdentifiers -framework Security
 
 LDFLAGS     := -dynamiclib -install_name @executable_path/Frameworks/$(TARGET) -dead_strip
 
@@ -49,7 +49,7 @@ $(BUILD_DIR)/%.o: src/%.mm | $(BUILD_DIR)
 
 $(TARGET): $(OBJ)
 	$(CXX) $(FLAGS) $(LDFLAGS) $(OBJ) $(FRAMEWORKS) -o $@
-	@echo "==> built $(TARGET) ($(shell wc -c < $(TARGET) | tr -d ' ') bytes)"
+	@echo "==> built $(TARGET) ($$(wc -c < $(TARGET) | tr -d ' ') bytes)"
 	codesign --force --sign - --timestamp=none $@ && echo "==> ad-hoc signed" || echo "!! codesign 失败（注入器通常会自己重签）"
 
 info: $(TARGET)
