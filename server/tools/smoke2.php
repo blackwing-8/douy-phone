@@ -201,11 +201,20 @@ for ($i = 0; $i < 6; $i++) {
 check($limited, '超过每日 5 次被 IOS_RATE_LIMITED');
 
 // ---------------------------------------------------------------- 5. 防篡改
-step('5. 插件代码哈希变化 → IOS_MODULE_CHANGED');
+$strict = !empty($config['license']['strict_module_check']);
+step('5. 插件代码哈希变化 → ' . ($strict ? '严格模式应拒绝' : '宽松模式应自动跟随'));
 $r = api('POST', '/api/ios/plugin/account/status', ['device_id' => $deviceId, 'module_text_sha256' => str_repeat('a', 64)]);
 check($r['body']['code'] === 'OK', '首次上报哈希被记录', $r['raw']);
+
 $r = api('POST', '/api/ios/plugin/account/status', ['device_id' => $deviceId, 'module_text_sha256' => str_repeat('b', 64)]);
-check($r['body']['code'] === 'IOS_MODULE_CHANGED', '哈希变化被拒绝', $r['raw']);
+if ($strict) {
+    check($r['body']['code'] === 'IOS_MODULE_CHANGED', '哈希变化被拒绝', $r['raw']);
+} else {
+    // 宽松模式：换新版插件不应该把用户锁死，而是记录并跟随
+    check($r['body']['code'] === 'OK', '哈希变化被接受（宽松模式）', $r['raw']);
+    $again = api('POST', '/api/ios/plugin/account/status', ['device_id' => $deviceId, 'module_text_sha256' => str_repeat('b', 64)]);
+    check($again['body']['code'] === 'OK', '同一新哈希再次请求仍然通过', $again['raw']);
+}
 
 echo "\n=========================================\n";
 echo "  PASS: $pass   FAIL: $fail\n";
