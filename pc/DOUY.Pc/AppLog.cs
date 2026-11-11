@@ -57,8 +57,17 @@ public static class AppLog
 
         if (_echoConsole)
         {
-            Console.WriteLine(text);
+            try
+            {
+                Console.WriteLine(text);
+            }
+            catch
+            {
+                // 无控制台 / 管道已关闭时忽略
+            }
         }
+
+        WriteToFile(text);
 
         try
         {
@@ -67,6 +76,87 @@ public static class AppLog
         catch
         {
             // 日志本身的异常一律吞掉
+        }
+    }
+
+    // ───────────────────────── 日志落盘 ─────────────────────────
+
+    /// <summary>
+    /// 日志文件路径：优先写 exe 同目录的 logs\douy.log（最直观、一定可读），
+    /// 目录不可写时回退到 %APPDATA%\DOUY\douy.log，再回退到临时目录。
+    /// </summary>
+    public static string LogFilePath { get; } = BuildLogPath();
+
+    private static string BuildLogPath()
+    {
+        // 1) exe 同目录
+        try
+        {
+            var baseDir = AppContext.BaseDirectory;
+            if (!string.IsNullOrWhiteSpace(baseDir))
+            {
+                var dir = Path.Combine(baseDir, "logs");
+                Directory.CreateDirectory(dir);
+                var probe = Path.Combine(dir, ".write-test");
+                File.WriteAllText(probe, "ok");
+                File.Delete(probe);
+                return Path.Combine(dir, "douy.log");
+            }
+        }
+        catch
+        {
+            // 继续尝试下一个位置
+        }
+
+        // 2) %APPDATA%\DOUY
+        try
+        {
+            var dir = Path.Combine(
+                Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData),
+                "DOUY");
+            Directory.CreateDirectory(dir);
+            return Path.Combine(dir, "douy.log");
+        }
+        catch
+        {
+            // 继续
+        }
+
+        // 3) 临时目录
+        return Path.Combine(Path.GetTempPath(), "douy.log");
+    }
+
+    private static void WriteToFile(string text)
+    {
+        try
+        {
+            lock (Gate)
+            {
+                var info = new FileInfo(LogFilePath);
+                if (info.Exists && info.Length > 5 * 1024 * 1024)
+                {
+                    var backup = LogFilePath + ".1";
+                    try
+                    {
+                        if (File.Exists(backup))
+                        {
+                            File.Delete(backup);
+                        }
+
+                        File.Move(LogFilePath, backup);
+                    }
+                    catch
+                    {
+                        // 轮转失败就继续追加
+                    }
+                }
+
+                File.AppendAllText(LogFilePath, text + Environment.NewLine, Encoding.UTF8);
+            }
+        }
+        catch
+        {
+            // 磁盘只读 / 权限不足时静默
         }
     }
 }
