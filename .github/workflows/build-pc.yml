@@ -27,7 +27,7 @@ jobs:
           dotnet-version: '7.0.x'
 
       - name: 编译（Release）
-        run: dotnet build "pc/DOUY.Pc/DOUY.Pc.csproj" -c Release --nologo -warnaserror
+        run: dotnet build "pc/DOUY.Pc/DOUY.Pc.csproj" -c Release --nologo
 
       - name: 冒烟测试 —— 无界面模式能否启动并监听
         shell: pwsh

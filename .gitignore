@@ -7,9 +7,9 @@ _mysqltest/
 _ossltest/
 _e2e/
 
-# ---- .NET 构建产物 ----
-bin/
-obj/
+# ---- .NET 构建产物（只针对 pc，避免误伤 server/bin）----
+pc/**/bin/
+pc/**/obj/
 *.user
 
 # ---- iOS 构建产物 ----
@@ -17,6 +17,9 @@ ios/DOUYTweak/build/
 ios/DOUYTweak/*.dylib
 ios/DOUYTweak/*.o
 ios/DOUYTweak/build.log
+
+# ---- 杂项 ----
+.rnd
 
 # ---- 测试产物 ----
 *.h264
