@@ -28,7 +28,8 @@ public sealed class MainForm : Form
     private const string AppTitle = "兜鱼手机输出";
     private const string AppSubtitle = "OBS → iPhone USB / 局域网 RTMP · 复刻版 1.0.0";
     private const string DefaultPath = "live/douy";
-    private const string FirewallRuleName = "DOUY OBS 手机局域网接收";
+    private const string FirewallRuleName = "DOUY Phone Output LAN";
+    private const string FirewallRuleLegacyName = "DOUY OBS 手机局域网接收";
     private const string DeviceHint = "未发现 iPhone（请解锁并信任此电脑，并安装 Apple Devices 或 iTunes）";
     private const int MaxLogLines = 2000;
 
@@ -1913,10 +1914,15 @@ public sealed class MainForm : Form
     {
         try
         {
-            // 单次提权里先删（忽略“规则不存在”）再添加，避免出现重复规则或两次 UAC。
-            var delete = $"netsh advfirewall firewall delete rule name=\"{FirewallRuleName}\" >nul 2>&1";
-            var add = $"netsh advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow protocol=TCP localport={port} profile=any";
-            var arguments = $"/c {delete} & {add}";
+            /*
+             * 规则名必须是纯 ASCII：netsh 是控制台老工具，中文规则名在部分系统上会出现
+             * "命令返回成功但 show rule 找不到规则" 的假失败（编码不一致）。
+             * 同时顺手清掉旧版本用中文名建的规则，避免重复规则。
+             */
+            var deleteOwn = $"netsh advfirewall firewall delete rule name=\"{FirewallRuleName}\" >nul 2>&1";
+            var deleteLegacy = $"netsh advfirewall firewall delete rule name=\"{FirewallRuleLegacyName}\" >nul 2>&1";
+            var add = $"netsh advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow protocol=TCP localport={port} profile=any enable=yes";
+            var arguments = $"/c {deleteOwn} & {deleteLegacy} & {add}";
 
             var startInfo = new ProcessStartInfo("cmd.exe", arguments)
             {
@@ -1941,13 +1947,14 @@ public sealed class MainForm : Form
 
             if (FirewallRuleExists())
             {
-                message = $"防火墙入站规则已就绪：TCP {port}（规则名：{FirewallRuleName}）。";
+                message = $"防火墙入站规则已就绪：TCP {port}\n规则名：{FirewallRuleName}";
                 return true;
             }
 
-            message = process.ExitCode == 0
-                ? "netsh 已执行，但未能确认规则存在，请打开 Windows 防火墙手动检查。"
-                : $"netsh 返回错误代码 {process.ExitCode}，防火墙规则未生效。";
+            message = "自动添加防火墙规则未成功。\n\n" +
+                      "请用【管理员】PowerShell 手动执行这一行：\n\n" +
+                      $"netsh advfirewall firewall add rule name=\"{FirewallRuleName}\" dir=in action=allow protocol=TCP localport={port} profile=any\n\n" +
+                      "（局域网模式必须放行该端口，否则手机连不上。USB 模式不受影响。）";
             return false;
         }
         catch (Win32Exception ex) when (ex.NativeErrorCode == 1223)
