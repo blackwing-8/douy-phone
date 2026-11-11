@@ -1,0 +1,31 @@
+# 帧相复刻版 · 授权服务（Apache 重写规则）
+# 把 public/ 设为站点根目录，或把本文件放到站点根目录并改 RewriteBase。
+
+<IfModule mod_rewrite.c>
+    RewriteEngine On
+    RewriteBase /
+
+    # 已有文件/目录直接返回（健康检查、静态资源）
+    RewriteCond %{REQUEST_FILENAME} -f [OR]
+    RewriteCond %{REQUEST_FILENAME} -d
+    RewriteRule ^ - [L]
+
+    # 其它一律进前端控制器
+    RewriteRule ^ index.php [L]
+</IfModule>
+
+# 禁止访问敏感目录（如果 server/ 被放进了 webroot）
+<IfModule mod_authz_core.c>
+    <FilesMatch "\.(sql|log|pem|key)$">
+        Require all denied
+    </FilesMatch>
+</IfModule>
+
+# 安全响应头
+<IfModule mod_headers.c>
+    Header always set X-Content-Type-Options "nosniff"
+    Header always set Referrer-Policy "no-referrer"
+</IfModule>
+
+# 关掉目录列表
+Options -Indexes

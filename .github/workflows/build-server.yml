@@ -1,0 +1,110 @@
+name: build-server
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'server/**'
+      - '.github/workflows/build-server.yml'
+  pull_request:
+    paths:
+      - 'server/**'
+  workflow_dispatch:
+
+jobs:
+  test:
+    name: PHP 授权服务 · 建表 + 密钥 + 接口冒烟
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    services:
+      mysql:
+        image: mysql:5.7
+        env:
+          MYSQL_ROOT_PASSWORD: root
+          MYSQL_DATABASE: douy_license
+        ports:
+          - 3306:3306
+        options: >-
+          --health-cmd="mysqladmin ping -h 127.0.0.1 -uroot -proot"
+          --health-interval=5s
+          --health-timeout=5s
+          --health-retries=20
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: 安装 PHP
+        uses: shivammathur/setup-php@v2
+        with:
+          php-version: '8.1'
+          extensions: openssl, pdo_mysql, curl, mbstring, json
+          ini-values: date.timezone=Asia/Shanghai
+
+      - name: 语法检查（全部 PHP 文件）
+        working-directory: server
+        run: |
+          set -e
+          fail=0
+          while IFS= read -r -d '' f; do
+            if ! php -l "$f" > /dev/null; then echo "::error file=$f::语法错误"; fail=1; fi
+          done < <(find . -name '*.php' -print0)
+          [ "$fail" -eq 0 ] && echo "全部 PHP 文件语法 OK"
+
+      - name: 生成本地配置（CI 用）
+        working-directory: server
+        run: |
+          cat > config.local.php <<'PHP'
+          <?php
+          return [
+              'app' => ['base_url' => 'http://127.0.0.1:8080', 'debug' => true],
+              'db'  => [
+                  'dsn'      => 'mysql:host=127.0.0.1;port=3306;dbname=douy_license;charset=utf8mb4',
+                  'user'     => 'root',
+                  'password' => 'root',
+              ],
+          ];
+          PHP
+
+      - name: 建表 + 生成密钥 + 造卡
+        working-directory: server
+        run: |
+          set -e
+          php bin/douyctl.php db:init
+          php bin/douyctl.php key:gen
+          php bin/douyctl.php plan:list
+          php bin/douyctl.php card:new --days=30 --count=3 --note=ci
+
+      - name: 起服务
+        working-directory: server
+        run: |
+          nohup php -S 127.0.0.1:8080 -t public public/index.php > /tmp/php-server.log 2>&1 &
+          for i in $(seq 1 20); do
+            if curl -s http://127.0.0.1:8080/health | grep -q '"OK"'; then echo "服务已就绪"; break; fi
+            sleep 1
+          done
+          curl -s http://127.0.0.1:8080/health
+
+      - name: 冒烟 1（注册/设备签名/登录/激活/租约/负例）
+        working-directory: server
+        run: |
+          set -e
+          CODE=$(php bin/douyctl.php card:new --days=30 --count=1 | tail -1 | tr -d '[:space:]')
+          echo "使用卡密: $CODE"
+          php tools/smoke.php "$CODE" | tee /tmp/smoke1.log
+          grep -q "FAIL: 0" /tmp/smoke1.log
+
+      - name: 冒烟 2（到账发卡/更新发布/下载配额/防篡改）
+        working-directory: server
+        run: |
+          set -e
+          php tools/smoke2.php | tee /tmp/smoke2.log
+          grep -q "FAIL: 0" /tmp/smoke2.log
+
+      - name: 失败时打印服务端日志
+        if: failure()
+        run: |
+          echo "---- php -S log ----"
+          tail -100 /tmp/php-server.log || true
+          echo "---- app.log ----"
+          tail -50 server/storage/app.log || true

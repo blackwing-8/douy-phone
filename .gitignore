@@ -1,0 +1,43 @@
+# ---- 逆向 / 分析 / 工具（体积大，不入库）----
+_re/
+_tools/
+_extract/
+_assets_tmp/
+_mysqltest/
+_ossltest/
+_e2e/
+
+# ---- .NET 构建产物 ----
+bin/
+obj/
+*.user
+
+# ---- iOS 构建产物 ----
+ios/DOUYTweak/build/
+ios/DOUYTweak/*.dylib
+ios/DOUYTweak/*.o
+ios/DOUYTweak/build.log
+
+# ---- 测试产物 ----
+*.h264
+*.aac
+received.*
+dump.*
+
+# ---- 注入目标（自备，勿提交）----
+ios/input/
+*.ipa
+*.app/
+
+# ---- 授权服务：机密与运行时产物（务必不要提交）----
+server/keys/
+server/config.local.php
+server/storage/
+
+# ---- 部署包产物 ----
+dist/
+
+# ---- 编辑器 ----
+.vs/
+.idea/
+.DS_Store

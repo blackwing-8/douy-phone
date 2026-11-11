@@ -1,0 +1,60 @@
+name: build-ios-dylib
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'ios/**'
+      - '.github/workflows/build-ios.yml'
+  pull_request:
+    paths:
+      - 'ios/**'
+      - '.github/workflows/build-ios.yml'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 编译 DOUY.dylib (arm64 / iOS 14+)
+    runs-on: macos-14
+    timeout-minutes: 20
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 打印工具链
+        run: |
+          xcodebuild -version
+          echo "SDK: $(xcrun --sdk iphoneos --show-sdk-path)"
+          echo "SDK 版本: $(xcrun --sdk iphoneos --show-sdk-version)"
+          sw_vers
+
+      - name: 编译
+        working-directory: ios/DOUYTweak
+        run: |
+          chmod +x scripts/verify.sh
+          make -j"$(sysctl -n hw.ncpu)" 2>&1 | tee build.log
+          test -f DOUY.dylib
+
+      - name: 校验产物
+        working-directory: ios/DOUYTweak
+        run: |
+          bash scripts/verify.sh DOUY.dylib
+          ls -lh DOUY.dylib
+          shasum -a 256 DOUY.dylib
+
+      - name: 归档编译日志（失败时也保留）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: build-log
+          path: ios/DOUYTweak/build.log
+          if-no-files-found: ignore
+
+      - name: 上传 dylib
+        uses: actions/upload-artifact@v4
+        with:
+          name: DOUY.dylib
+          path: ios/DOUYTweak/DOUY.dylib
+          if-no-files-found: error
+          retention-days: 30

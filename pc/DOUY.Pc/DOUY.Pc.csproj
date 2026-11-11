@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <TargetFramework>net7.0-windows</TargetFramework>
+    <UseWindowsForms>true</UseWindowsForms>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <AssemblyName>DOUY.Pc</AssemblyName>
+    <RootNamespace>DOUY.Pc</RootNamespace>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+    <ApplicationIcon>Assets\app.ico</ApplicationIcon>
+    <Version>1.0.0</Version>
+    <Product>兜鱼 DOUY · OBS 手机输出</Product>
+    <Company>DOUY</Company>
+    <Copyright>Copyright © DOUY</Copyright>
+    <SatelliteResourceLanguages>en</SatelliteResourceLanguages>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <EnableWindowsTargeting>true</EnableWindowsTargeting>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <!-- 界面左上角的品牌 logo（运行时从程序集资源读取） -->
+    <EmbeddedResource Include="Assets\logo.png" LogicalName="DOUY.Pc.Assets.logo.png" />
+  </ItemGroup>
+
+</Project>

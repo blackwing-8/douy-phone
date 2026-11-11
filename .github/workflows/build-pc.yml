@@ -1,0 +1,51 @@
+name: build-pc
+
+on:
+  push:
+    branches: [ main, master ]
+    paths:
+      - 'pc/**'
+      - '.github/workflows/build-pc.yml'
+  pull_request:
+    paths:
+      - 'pc/**'
+  workflow_dispatch:
+
+jobs:
+  build:
+    name: 编译 Windows 端（.NET 7）
+    runs-on: windows-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: 检出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 .NET SDK
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: '7.0.x'
+
+      - name: 编译（Release）
+        run: dotnet build "pc/DOUY.Pc/DOUY.Pc.csproj" -c Release --nologo -warnaserror
+
+      - name: 冒烟测试 —— 无界面模式能否启动并监听
+        shell: pwsh
+        run: |
+          $exe = "pc/DOUY.Pc/bin/Release/net7.0-windows/DOUY.Pc.exe"
+          $p = Start-Process -FilePath $exe -ArgumentList @("serve", "--port", "19351", "--phone", "127.0.0.1:28766") `
+                             -RedirectStandardOutput "pc.log" -RedirectStandardError "pc.err.log" -PassThru -WindowStyle Hidden
+          Start-Sleep -Seconds 5
+          if ($p.HasExited) { Get-Content pc.log; Get-Content pc.err.log; throw "PC 端启动即退出" }
+          Get-Content pc.log | Select-Object -First 20
+          if (-not (Select-String -Path pc.log -Pattern "RTMP 服务已启动" -Quiet)) { throw "没有看到 RTMP 监听日志" }
+          Stop-Process -Id $p.Id -Force
+          Write-Host "冒烟测试通过"
+
+      - name: 上传产物
+        uses: actions/upload-artifact@v4
+        with:
+          name: DOUY.Pc-win64
+          path: pc/DOUY.Pc/bin/Release/net7.0-windows/
+          if-no-files-found: error
+          retention-days: 30
