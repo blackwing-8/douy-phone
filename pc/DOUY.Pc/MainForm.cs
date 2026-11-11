@@ -292,7 +292,7 @@ public sealed class MainForm : Form
 
         // ---- 地址卡片 ----
         _addressCard = MakeCard();
-        _addressTitleLabel = MakeLabel("拉流地址（手机 / 播放器可直接打开）", 9f, Theme.Muted);
+        _addressTitleLabel = MakeLabel("地址速查：OBS 用上面的服务器+推流码，手机用下面的完整地址", 9f, Theme.Muted);
         _addressBox = MakeTextBox(string.Empty, readOnly: true, multiline: true);
         _addressBox.Font = LogFont(9f);
         _addressBox.ScrollBars = ScrollBars.Vertical;
@@ -1028,30 +1028,44 @@ public sealed class MainForm : Form
             var path = NormalizePath(_pathBox.Text);
             var builder = new StringBuilder();
 
-            if (_mode == OutputMode.LanRtmp)
+            // live/douy → app=live, key=douy（OBS 要拆成「服务器 + 推流码」两段填）
+            var slash = path.LastIndexOf('/');
+            var app = slash > 0 ? path[..slash] : path;
+            var streamKey = slash > 0 && slash < path.Length - 1 ? path[(slash + 1)..] : "douy";
+
+            builder.AppendLine("========== OBS 推流配置（OBS → 本机）==========");
+            builder.AppendLine($"服务器：rtmp://127.0.0.1:{port}/{app}");
+            builder.AppendLine($"推流码：{streamKey}");
+            builder.AppendLine();
+
+            if (_mode == OutputMode.External)
             {
+                var target = _externalUrlBox.Text.Trim();
+                if (target.Length > 0)
+                {
+                    builder.AppendLine("转推 → " + target);
+                    builder.AppendLine();
+                }
+            }
+
+            if (_mode == OutputMode.Usb)
+            {
+                builder.AppendLine("========== USB 模式 ==========");
+                builder.AppendLine($"OBS 推流后经数据线送到 iPhone（手机端选「USB 直连」，监听 {_devicePortBox.Value}）");
+            }
+            else
+            {
+                builder.AppendLine("========== 手机拉流地址（同一 WiFi）==========");
                 var addresses = SafeLocalAddresses();
                 if (addresses.Count == 0)
                 {
-                    builder.AppendLine($"rtmp://127.0.0.1:{port}/{path}");
+                    builder.AppendLine("（未检测到有效局域网 IP，请检查 WiFi / 网线连接）");
                 }
                 else
                 {
                     foreach (var ip in addresses)
                     {
                         builder.AppendLine($"rtmp://{ip}:{port}/{path}");
-                    }
-                }
-            }
-            else
-            {
-                builder.AppendLine($"rtmp://127.0.0.1:{port}/{path}");
-                if (_mode == OutputMode.External)
-                {
-                    var target = _externalUrlBox.Text.Trim();
-                    if (target.Length > 0)
-                    {
-                        builder.AppendLine("转推 → " + target);
                     }
                 }
             }
@@ -1071,10 +1085,15 @@ public sealed class MainForm : Form
         {
             foreach (var ip in Program.LocalAddresses())
             {
-                if (!string.IsNullOrWhiteSpace(ip) && !results.Contains(ip))
+                // 169.254.x.x 是 DHCP 失败时的链路本地地址，手机根本连不上，直接不显示
+                if (string.IsNullOrWhiteSpace(ip)
+                    || ip.StartsWith("169.254.", StringComparison.Ordinal)
+                    || results.Contains(ip))
                 {
-                    results.Add(ip);
+                    continue;
                 }
+
+                results.Add(ip);
             }
         }
         catch (Exception ex)
