@@ -45,6 +45,13 @@ $config = [
         'signal_aud_update'     => 'douy-ios-plugin-update',
         'automatic_renewal'     => true,    // 到期自动续用备用卡
         'auto_promote_standby'  => true,    // 卡包里的备用卡在有绑定时不自动生效
+
+        /*
+         * 插件代码哈希防篡改：
+         *   false（默认）—— 哈希变化时只记审计并自动更新，正常发版/热更新不会被误杀；
+         *   true         —— 哈希变化直接拒绝（IOS_MODULE_CHANGED），适合正式发布后开启。
+         */
+        'strict_module_check'   => false,
     ],
 ];
 
