@@ -11,6 +11,16 @@ internal static class Program
     [STAThread]
     private static int Main(string[] args)
     {
+        // 日志统一 UTF-8，避免重定向到文件/CI 里中文变问号
+        try
+        {
+            Console.OutputEncoding = System.Text.Encoding.UTF8;
+        }
+        catch
+        {
+            // WinExe 双击（无控制台）时设置会抛，忽略即可
+        }
+
         var command = args.Length > 0 ? args[0].ToLowerInvariant() : "gui";
         try
         {

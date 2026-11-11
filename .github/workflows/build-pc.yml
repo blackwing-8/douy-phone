@@ -32,15 +32,30 @@ jobs:
       - name: 冒烟测试 —— 无界面模式能否启动并监听
         shell: pwsh
         run: |
+          $env:DOTNET_CLI_UI_LANGUAGE = "en"
+          [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
           $exe = "pc/DOUY.Pc/bin/Release/net7.0-windows/DOUY.Pc.exe"
-          $p = Start-Process -FilePath $exe -ArgumentList @("serve", "--port", "19351", "--phone", "127.0.0.1:28766") `
+          $port = 19351
+          $p = Start-Process -FilePath $exe -ArgumentList @("serve", "--port", "$port", "--phone", "127.0.0.1:28767") `
                              -RedirectStandardOutput "pc.log" -RedirectStandardError "pc.err.log" -PassThru -WindowStyle Hidden
-          Start-Sleep -Seconds 5
-          if ($p.HasExited) { Get-Content pc.log; Get-Content pc.err.log; throw "PC 端启动即退出" }
-          Get-Content pc.log | Select-Object -First 20
-          if (-not (Select-String -Path pc.log -Pattern "RTMP 服务已启动" -Quiet)) { throw "没有看到 RTMP 监听日志" }
+          Start-Sleep -Seconds 3
+          if ($p.HasExited) { Get-Content pc.log -Encoding UTF8; Get-Content pc.err.log -Encoding UTF8; throw "PC 端启动即退出" }
+
+          # 用「端口是否在监听」判定，避免依赖日志里的中文（CI 控制台编码不可控）
+          $listening = $false
+          for ($i = 0; $i -lt 20; $i++) {
+            $client = New-Object System.Net.Sockets.TcpClient
+            try {
+              $client.Connect("127.0.0.1", $port)
+              $listening = $client.Connected
+            } catch { $listening = $false } finally { $client.Dispose() }
+            if ($listening) { break }
+            Start-Sleep -Milliseconds 500
+          }
+          Get-Content pc.log -Encoding UTF8 | Select-Object -First 15
+          if (-not $listening) { Get-Content pc.err.log -Encoding UTF8; throw "端口 $port 未监听，PC 端没有起来" }
           Stop-Process -Id $p.Id -Force
-          Write-Host "冒烟测试通过"
+          Write-Host "冒烟测试通过：RTMP 端口 $port 已在监听"
 
       - name: 上传产物
         uses: actions/upload-artifact@v4

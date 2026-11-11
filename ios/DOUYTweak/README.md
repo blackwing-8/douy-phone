@@ -129,3 +129,9 @@ cd work && zip -qry ../app-injected.ipa Payload
   但极端情况下（宿主自己 swizzle 了同一方法）可能互相覆盖 —— 原版也有同样的限制。
 - 音频替换要求宿主开麦采集；宿主没开麦时不会凭空造音频轨。
 - 首次编译需要在 CI/macOS 上过一遍；本仓库的 Windows 环境下无法做语法级验证。
+
+## 构建状态
+
+- 由 .github/workflows/build-ios.yml 在 macOS runner 上编译（arm64 / iOS 14+）。
+- 产物：DOUY.dylib（约 200 KB），可在 Actions 的 Artifacts 里下载。
+- 改动任何 ios/** 下的文件都会触发一次构建。
