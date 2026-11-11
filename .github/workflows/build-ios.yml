@@ -15,7 +15,7 @@ on:
 jobs:
   build:
     name: 编译 DOUY.dylib (arm64 / iOS 14+)
-    runs-on: macos-15   # macos-14 已于 2026-11-02 退役
+    runs-on: macos-15-intel   # macos-14 已于 2026-11-02 退役
     timeout-minutes: 20
 
     steps:
