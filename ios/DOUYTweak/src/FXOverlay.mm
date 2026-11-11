@@ -15,21 +15,37 @@
 
 @implementation FXOverlayWindow
 
-- (BOOL)pointInside:(CGPoint)point withEvent:(UIEvent *)event
+/*
+ * 关键：只让悬浮球 / 面板接收触摸，其它区域一律返回 nil 透传给下层的 App。
+ * 之前这个 window 是 Alert 级别的全屏窗口且整块吃触摸，导致注入后宿主（抖音）
+ * 点哪都没反应。
+ */
+- (UIView *)hitTest:(CGPoint)point withEvent:(UIEvent *)event
 {
-    BOOL inside = [super pointInside:point withEvent:event];
-    if (!inside)
+    UIView *view = [super hitTest:point withEvent:event];
+    if (view == nil)
     {
-        return NO;
+        return nil;
     }
-    return YES;
+    UIViewController *root = self.rootViewController;
+    if (root != nil && view == root.view)
+    {
+        return nil;
+    }
+    return view;
 }
 
 @end
 
+static NSString *const kFXDefaultsOverlayLeading = @"FXOverlayLeading";
+static NSString *const kFXDefaultsOverlayTop     = @"FXOverlayTop";
+static const CGFloat kFXBallSize   = 58.0;
+static const CGFloat kFXPanelWidth = 300.0;
+
 @interface FXOverlayController : NSObject <UIDocumentPickerDelegate>
 @property (nonatomic, strong) FXOverlayWindow *window;
 @property (nonatomic, strong) UIView *panel;
+@property (nonatomic, strong) UIView *ball;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *modeButtons;
 @property (nonatomic, strong) UIButton *audioButton;
@@ -38,6 +54,10 @@
 @property (nonatomic, strong) UIButton *collapseButton;
 @property (nonatomic, strong) UIButton *accountButton;
 @property (nonatomic, assign) BOOL collapsed;
+@property (nonatomic, strong) NSLayoutConstraint *panelLeading;
+@property (nonatomic, strong) NSLayoutConstraint *panelTop;
+@property (nonatomic, strong) NSLayoutConstraint *ballLeading;
+@property (nonatomic, strong) NSLayoutConstraint *ballTop;
 + (instancetype)shared;
 - (void)attachToScene:(UIWindowScene *)scene;
 - (void)setVisible:(BOOL)visible;
@@ -69,20 +89,72 @@
     });
 }
 
-- (UIButton *)makeButton:(NSString *)title action:(SEL)action
+- (UIButton *)makeButton:(NSString *)title action:(SEL)action height:(CGFloat)height fontSize:(CGFloat)fontSize
 {
     UIButton *button = [UIButton buttonWithType:UIButtonTypeSystem];
     [button setTitle:title forState:UIControlStateNormal];
     [button setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    button.titleLabel.font = [UIFont systemFontOfSize:13 weight:UIFontWeightSemibold];
-    button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
-    button.layer.cornerRadius = 8.0;
-    button.contentEdgeInsets = UIEdgeInsetsMake(6, 10, 6, 10);
+    button.titleLabel.font = [UIFont systemFontOfSize:fontSize weight:UIFontWeightSemibold];
+    button.titleLabel.adjustsFontSizeToFitWidth = YES;
+    button.titleLabel.minimumScaleFactor = 0.7;
+    button.titleLabel.lineBreakMode = NSLineBreakByClipping;
+    button.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.14];
+    button.layer.cornerRadius = 10.0;
+    button.contentEdgeInsets = UIEdgeInsetsMake(4, 4, 4, 4);
     [button addTarget:self action:action forControlEvents:UIControlEventTouchUpInside];
     button.translatesAutoresizingMaskIntoConstraints = NO;
-    [button.heightAnchor constraintEqualToConstant:32].active = YES;
+    [button.heightAnchor constraintEqualToConstant:height].active = YES;
     return button;
 }
+
+- (UIStackView *)rowWithButtons:(NSArray<UIButton *> *)buttons spacing:(CGFloat)spacing
+{
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:buttons];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.spacing = spacing;
+    row.distribution = UIStackViewDistributionFillEqually;
+    return row;
+}
+
+#pragma mark - 悬浮球
+
+- (UIView *)makeBallWithLogo:(UIImage *)logo
+{
+    UIView *ball = [[UIView alloc] init];
+    ball.backgroundColor = [UIColor whiteColor];
+    ball.layer.cornerRadius = kFXBallSize / 2.0;
+    ball.layer.borderWidth = 2.0;
+    ball.layer.borderColor = [UIColor colorWithWhite:1.0 alpha:0.95].CGColor;
+    ball.layer.shadowColor = [UIColor blackColor].CGColor;
+    ball.layer.shadowOpacity = 0.35;
+    ball.layer.shadowRadius = 9.0;
+    ball.layer.shadowOffset = CGSizeMake(0, 3);
+    ball.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIImageView *imageView = [[UIImageView alloc] initWithImage:logo];
+    imageView.contentMode = UIViewContentModeScaleAspectFill;
+    imageView.clipsToBounds = YES;
+    imageView.layer.cornerRadius = kFXBallSize / 2.0 - 5.0;
+    imageView.userInteractionEnabled = NO;
+    imageView.translatesAutoresizingMaskIntoConstraints = NO;
+    [ball addSubview:imageView];
+    [NSLayoutConstraint activateConstraints:@[
+        [imageView.centerXAnchor constraintEqualToAnchor:ball.centerXAnchor],
+        [imageView.centerYAnchor constraintEqualToAnchor:ball.centerYAnchor],
+        [imageView.widthAnchor constraintEqualToConstant:kFXBallSize - 10.0],
+        [imageView.heightAnchor constraintEqualToConstant:kFXBallSize - 10.0],
+    ]];
+
+    UITapGestureRecognizer *tap = [[UITapGestureRecognizer alloc] initWithTarget:self action:@selector(expandPanel)];
+    [ball addGestureRecognizer:tap];
+
+    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [ball addGestureRecognizer:pan];
+
+    return ball;
+}
+
+#pragma mark - 构建界面
 
 - (void)attachToScene:(UIWindowScene *)scene
 {
@@ -98,119 +170,146 @@
     window.rootViewController.view.backgroundColor = [UIColor clearColor];
     self.window = window;
 
-    UIView *panel = [[UIView alloc] initWithFrame:CGRectMake(0, 0, 260, 210)];
-    panel.backgroundColor = [UIColor colorWithWhite:0.1 alpha:0.88];
-    panel.layer.cornerRadius = 14.0;
+    UIView *root = window.rootViewController.view;
+    CGRect screen = scene.screen.bounds;
+
+    // ---------------------------------------------------------- 面板
+    UIView *panel = [[UIView alloc] init];
+    panel.backgroundColor = [UIColor colorWithWhite:0.07 alpha:0.93];
+    panel.layer.cornerRadius = 16.0;
     panel.layer.masksToBounds = YES;
     panel.translatesAutoresizingMaskIntoConstraints = NO;
     self.panel = panel;
-    [window.rootViewController.view addSubview:panel];
+    [root addSubview:panel];
 
     UIImageView *logoView = [[UIImageView alloc] initWithImage:FXLogoImage()];
     logoView.contentMode = UIViewContentModeScaleAspectFit;
-    logoView.layer.cornerRadius = 6.0;
+    logoView.layer.cornerRadius = 7.0;
     logoView.layer.masksToBounds = YES;
     logoView.translatesAutoresizingMaskIntoConstraints = NO;
 
     UILabel *title = [[UILabel alloc] init];
-    title.text = @"兜鱼";
+    title.text = @"兜鱼 DOUY";
     title.textColor = [UIColor whiteColor];
-    title.font = [UIFont systemFontOfSize:15 weight:UIFontWeightBold];
+    title.font = [UIFont systemFontOfSize:17 weight:UIFontWeightBold];
     title.translatesAutoresizingMaskIntoConstraints = NO;
+
+    UIButton *collapse = [UIButton buttonWithType:UIButtonTypeSystem];
+    [collapse setTitle:@"收起" forState:UIControlStateNormal];
+    [collapse setTitleColor:[UIColor colorWithWhite:0.85 alpha:1.0] forState:UIControlStateNormal];
+    collapse.titleLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
+    [collapse addTarget:self action:@selector(collapsePanel) forControlEvents:UIControlEventTouchUpInside];
+    collapse.translatesAutoresizingMaskIntoConstraints = NO;
+    self.collapseButton = collapse;
+
+    UIStackView *header = [[UIStackView alloc] initWithArrangedSubviews:@[ logoView, title, collapse ]];
+    header.axis = UILayoutConstraintAxisHorizontal;
+    header.alignment = UIStackViewAlignmentCenter;
+    header.spacing = 8;
+    header.translatesAutoresizingMaskIntoConstraints = NO;
+    [header setCustomSpacing:16.0 afterView:title];
+    [logoView.widthAnchor constraintEqualToConstant:26].active = YES;
+    [logoView.heightAnchor constraintEqualToConstant:26].active = YES;
+    [collapse.widthAnchor constraintEqualToConstant:48].active = YES;
 
     UILabel *status = [[UILabel alloc] init];
     status.text = [[FXMediaStore shared] statusText];
-    status.textColor = [UIColor colorWithWhite:0.8 alpha:1.0];
-    status.font = [UIFont systemFontOfSize:11];
+    status.textColor = [UIColor colorWithWhite:0.82 alpha:1.0];
+    status.font = [UIFont systemFontOfSize:13 weight:UIFontWeightRegular];
     status.numberOfLines = 2;
     status.translatesAutoresizingMaskIntoConstraints = NO;
     self.statusLabel = status;
 
-    UIButton *collapse = [UIButton buttonWithType:UIButtonTypeSystem];
-    [collapse setTitle:@"收起" forState:UIControlStateNormal];
-    [collapse setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    collapse.titleLabel.font = [UIFont systemFontOfSize:12];
-    [collapse addTarget:self action:@selector(toggleCollapse) forControlEvents:UIControlEventTouchUpInside];
-    collapse.translatesAutoresizingMaskIntoConstraints = NO;
-    self.collapseButton = collapse;
+    UILabel *modeHint = [[UILabel alloc] init];
+    modeHint.text = @"画面来源";
+    modeHint.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+    modeHint.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    modeHint.translatesAutoresizingMaskIntoConstraints = NO;
 
-    UIStackView *modes = [[UIStackView alloc] init];
-    modes.axis = UILayoutConstraintAxisHorizontal;
-    modes.spacing = 6;
-    modes.distribution = UIStackViewDistributionFillEqually;
-    modes.translatesAutoresizingMaskIntoConstraints = NO;
+    UIButton *real = [self makeButton:@"真实摄像头" action:@selector(modeTapped:) height:46 fontSize:15];
+    real.tag = 100 + FXSourceModeRealCamera;
+    UIButton *usb = [self makeButton:@"USB 直连" action:@selector(modeTapped:) height:46 fontSize:15];
+    usb.tag = 100 + FXSourceModeUSB;
+    UIButton *rtmp = [self makeButton:@"RTMP 拉流" action:@selector(modeTapped:) height:46 fontSize:15];
+    rtmp.tag = 100 + FXSourceModeRTMP;
+    UIButton *local = [self makeButton:@"本地视频" action:@selector(modeTapped:) height:46 fontSize:15];
+    local.tag = 100 + FXSourceModeLocalFile;
+    [self.modeButtons addObjectsFromArray:@[ real, usb, rtmp, local ]];
 
-    NSArray *titles = @[ @"真实摄像头", @"USB 直连", @"RTMP", @"本地视频" ];
-    for (NSInteger i = 0; i < titles.count; i++)
-    {
-        UIButton *button = [self makeButton:titles[i] action:@selector(modeTapped:)];
-        button.tag = 100 + i;
-        [modes addArrangedSubview:button];
-        [self.modeButtons addObject:button];
-    }
+    UIStackView *modeRow1 = [self rowWithButtons:@[ real, usb ] spacing:8];
+    UIStackView *modeRow2 = [self rowWithButtons:@[ rtmp, local ] spacing:8];
 
-    UIStackView *actions = [[UIStackView alloc] init];
-    actions.axis = UILayoutConstraintAxisHorizontal;
-    actions.spacing = 6;
-    actions.distribution = UIStackViewDistributionFillEqually;
-    actions.translatesAutoresizingMaskIntoConstraints = NO;
+    UILabel *actionHint = [[UILabel alloc] init];
+    actionHint.text = @"画面调整";
+    actionHint.textColor = [UIColor colorWithWhite:0.62 alpha:1.0];
+    actionHint.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+    actionHint.translatesAutoresizingMaskIntoConstraints = NO;
 
-    self.rotateButton = [self makeButton:@"旋转 0°" action:@selector(rotateTapped)];
-    self.mirrorButton = [self makeButton:@"镜像：关" action:@selector(mirrorTapped)];
-    self.audioButton = [self makeButton:@"音频替换：关" action:@selector(audioTapped)];
-    [actions addArrangedSubview:self.rotateButton];
-    [actions addArrangedSubview:self.mirrorButton];
-    [actions addArrangedSubview:self.audioButton];
+    self.rotateButton = [self makeButton:@"旋转 0°" action:@selector(rotateTapped) height:42 fontSize:14];
+    self.mirrorButton = [self makeButton:@"镜像：关" action:@selector(mirrorTapped) height:42 fontSize:14];
+    self.audioButton = [self makeButton:@"音频替换：关" action:@selector(audioTapped) height:42 fontSize:14];
+    UIStackView *actionRow = [self rowWithButtons:@[ self.rotateButton, self.mirrorButton, self.audioButton ] spacing:8];
 
-    UIStackView *accountRow = [[UIStackView alloc] init];
-    accountRow.axis = UILayoutConstraintAxisHorizontal;
-    accountRow.distribution = UIStackViewDistributionFillEqually;
-    accountRow.translatesAutoresizingMaskIntoConstraints = NO;
-    self.accountButton = [self makeButton:@"账号与卡包" action:@selector(accountTapped)];
-    [accountRow addArrangedSubview:self.accountButton];
+    self.accountButton = [self makeButton:@"账号与卡包" action:@selector(accountTapped) height:48 fontSize:16];
+    self.accountButton.backgroundColor = [UIColor colorWithRed:0.23 green:0.55 blue:1.0 alpha:0.85];
 
-    [panel addSubview:logoView];
-    [panel addSubview:title];
-    [panel addSubview:collapse];
-    [panel addSubview:status];
-    [panel addSubview:modes];
-    [panel addSubview:actions];
-    [panel addSubview:accountRow];
+    UIStackView *content = [[UIStackView alloc] initWithArrangedSubviews:@[
+        header, status, modeHint, modeRow1, modeRow2, actionHint, actionRow, self.accountButton
+    ]];
+    content.axis = UILayoutConstraintAxisVertical;
+    content.spacing = 10;
+    content.translatesAutoresizingMaskIntoConstraints = NO;
+    [content setCustomSpacing:4.0 afterView:status];
+    [content setCustomSpacing:4.0 afterView:modeHint];
+    [content setCustomSpacing:4.0 afterView:actionHint];
+    [content setCustomSpacing:14.0 afterView:actionRow];
+    [panel addSubview:content];
 
-    UILayoutGuide *guide = panel.layoutMarginsGuide;
     [NSLayoutConstraint activateConstraints:@[
-        [panel.widthAnchor constraintEqualToConstant:260],
-        [logoView.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [logoView.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
-        [logoView.widthAnchor constraintEqualToConstant:22],
-        [logoView.heightAnchor constraintEqualToConstant:22],
-        [title.leadingAnchor constraintEqualToAnchor:logoView.trailingAnchor constant:8],
-        [title.topAnchor constraintEqualToAnchor:guide.topAnchor],
-        [collapse.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [collapse.centerYAnchor constraintEqualToAnchor:title.centerYAnchor],
-        [status.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [status.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [status.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:2],
-        [modes.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [modes.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [modes.topAnchor constraintEqualToAnchor:status.bottomAnchor constant:8],
-        [actions.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [actions.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [actions.topAnchor constraintEqualToAnchor:modes.bottomAnchor constant:6],
-        [accountRow.leadingAnchor constraintEqualToAnchor:guide.leadingAnchor],
-        [accountRow.trailingAnchor constraintEqualToAnchor:guide.trailingAnchor],
-        [accountRow.topAnchor constraintEqualToAnchor:actions.bottomAnchor constant:6],
-        [accountRow.bottomAnchor constraintEqualToAnchor:guide.bottomAnchor],
+        [content.topAnchor constraintEqualToAnchor:panel.topAnchor constant:16],
+        [content.leadingAnchor constraintEqualToAnchor:panel.leadingAnchor constant:16],
+        [content.trailingAnchor constraintEqualToAnchor:panel.trailingAnchor constant:-16],
+        [content.bottomAnchor constraintEqualToAnchor:panel.bottomAnchor constant:-16],
+        [panel.widthAnchor constraintEqualToConstant:kFXPanelWidth],
     ]];
 
-    UIPanGestureRecognizer *pan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
-    [title addGestureRecognizer:pan];
-    title.userInteractionEnabled = YES;
+    // 位置（可记住上次拖动的位置）
+    NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+    CGFloat savedLeading = [defaults doubleForKey:kFXDefaultsOverlayLeading];
+    CGFloat savedTop = [defaults doubleForKey:kFXDefaultsOverlayTop];
+    if (savedLeading <= 0)
+    {
+        savedLeading = MAX(10.0, screen.size.width - kFXPanelWidth - 14.0);
+    }
+    if (savedTop <= 0)
+    {
+        savedTop = 110.0;
+    }
 
-    NSLayoutConstraint *top = [panel.topAnchor constraintEqualToAnchor:window.rootViewController.view.safeAreaLayoutGuide.topAnchor constant:60];
-    NSLayoutConstraint *trailing = [panel.trailingAnchor constraintEqualToAnchor:window.rootViewController.view.trailingAnchor constant:-12];
-    top.active = YES;
-    trailing.active = YES;
+    self.panelLeading = [panel.leadingAnchor constraintEqualToAnchor:root.leadingAnchor constant:savedLeading];
+    self.panelTop = [panel.topAnchor constraintEqualToAnchor:root.topAnchor constant:savedTop];
+    self.panelLeading.active = YES;
+    self.panelTop.active = YES;
+
+    UIPanGestureRecognizer *panelPan = [[UIPanGestureRecognizer alloc] initWithTarget:self action:@selector(handlePan:)];
+    [panel addGestureRecognizer:panelPan];
+
+    // ---------------------------------------------------------- 悬浮球（收起态）
+    UIView *ball = [self makeBallWithLogo:FXLogoImage()];
+    self.ball = ball;
+    [root addSubview:ball];
+
+    self.ballLeading = [ball.leadingAnchor constraintEqualToAnchor:root.leadingAnchor
+                                                          constant:MAX(10.0, screen.size.width - kFXBallSize - 18.0)];
+    self.ballTop = [ball.topAnchor constraintEqualToAnchor:root.topAnchor constant:savedTop];
+    NSLayoutConstraint *ballW = [ball.widthAnchor constraintEqualToConstant:kFXBallSize];
+    NSLayoutConstraint *ballH = [ball.heightAnchor constraintEqualToConstant:kFXBallSize];
+    self.ballLeading.active = YES;
+    self.ballTop.active = YES;
+    ballW.active = YES;
+    ballH.active = YES;
+
+    ball.hidden = YES;
 
     window.hidden = NO;
     [self refreshButtons];
@@ -221,35 +320,71 @@
     self.window.hidden = !visible;
 }
 
+#pragma mark - 拖动 / 收起 / 展开
+
 - (void)handlePan:(UIPanGestureRecognizer *)pan
 {
-    CGPoint translation = [pan translationInView:self.window];
-    self.panel.transform = CGAffineTransformMakeTranslation(translation.x, translation.y);
+    UIView *root = self.window.rootViewController.view;
+    if (root == nil)
+    {
+        return;
+    }
+    CGPoint translation = [pan translationInView:root];
+
+    if (pan.view == self.ball)
+    {
+        CGFloat maxX = MAX(10.0, root.bounds.size.width - kFXBallSize - 10.0);
+        CGFloat maxY = MAX(60.0, root.bounds.size.height - kFXBallSize - 40.0);
+        self.ballLeading.constant = MAX(10.0, MIN(self.ballLeading.constant + translation.x, maxX));
+        self.ballTop.constant = MAX(60.0, MIN(self.ballTop.constant + translation.y, maxY));
+    }
+    else
+    {
+        [self.panel layoutIfNeeded];
+        CGFloat panelH = self.panel.bounds.size.height;
+        CGFloat maxX = MAX(10.0, root.bounds.size.width - kFXPanelWidth - 10.0);
+        CGFloat maxY = MAX(60.0, root.bounds.size.height - panelH - 30.0);
+        self.panelLeading.constant = MAX(10.0, MIN(self.panelLeading.constant + translation.x, maxX));
+        self.panelTop.constant = MAX(60.0, MIN(self.panelTop.constant + translation.y, maxY));
+    }
+
+    [pan setTranslation:CGPointZero inView:root];
+
     if (pan.state == UIGestureRecognizerStateEnded || pan.state == UIGestureRecognizerStateCancelled)
     {
-        CGRect frame = self.panel.frame;
-        self.panel.transform = CGAffineTransformIdentity;
-        UIView *root = self.window.rootViewController.view;
-        frame.origin.x = MAX(8, MIN(frame.origin.x, root.bounds.size.width - frame.size.width - 8));
-        frame.origin.y = MAX(40, MIN(frame.origin.y, root.bounds.size.height - frame.size.height - 40));
-        self.panel.translatesAutoresizingMaskIntoConstraints = YES;
-        self.panel.frame = frame;
+        NSUserDefaults *defaults = [NSUserDefaults standardUserDefaults];
+        [defaults setDouble:self.panelLeading.constant forKey:kFXDefaultsOverlayLeading];
+        [defaults setDouble:self.panelTop.constant forKey:kFXDefaultsOverlayTop];
     }
+}
+
+- (void)collapsePanel
+{
+    self.collapsed = YES;
+    self.panel.hidden = YES;
+    self.ball.hidden = NO;
+
+    // 球放到面板右上角，视觉上像「缩成一个圆球」
+    self.ballTop.constant = self.panelTop.constant + 8.0;
+    self.ballLeading.constant = self.panelLeading.constant + kFXPanelWidth - kFXBallSize - 8.0;
+}
+
+- (void)expandPanel
+{
+    self.collapsed = NO;
+    self.ball.hidden = YES;
+    self.panel.hidden = NO;
 }
 
 - (void)toggleCollapse
 {
-    self.collapsed = !self.collapsed;
-    for (UIView *view in self.panel.subviews)
+    if (self.collapsed)
     {
-        if (view == self.statusLabel || view == self.collapseButton)
-        {
-            continue;
-        }
-        if ([view isKindOfClass:[UIStackView class]])
-        {
-            view.hidden = self.collapsed;
-        }
+        [self expandPanel];
+    }
+    else
+    {
+        [self collapsePanel];
     }
 }
 
@@ -260,28 +395,29 @@
     {
         NSInteger mode = button.tag - 100;
         BOOL selected = (NSInteger)store.mode == mode;
-        button.backgroundColor = selected ? [UIColor colorWithRed:0.23 green:0.63 blue:1.0 alpha:0.9]
-                                          : [UIColor colorWithWhite:1.0 alpha:0.12];
+        button.backgroundColor = selected ? [UIColor colorWithRed:0.23 green:0.63 blue:1.0 alpha:0.95]
+                                          : [UIColor colorWithWhite:1.0 alpha:0.14];
     }
 
     [self.rotateButton setTitle:[NSString stringWithFormat:@"旋转 %ld°", (long)store.rotation] forState:UIControlStateNormal];
     [self.mirrorButton setTitle:store.mirror ? @"镜像：开" : @"镜像：关" forState:UIControlStateNormal];
     [self.audioButton setTitle:store.audioReplaceEnabled ? @"音频替换：开" : @"音频替换：关" forState:UIControlStateNormal];
+
     FXLicense *license = [FXLicense shared];
     if (!license.loggedIn)
     {
         [self.accountButton setTitle:@"账号与卡包（未登录）" forState:UIControlStateNormal];
-        self.accountButton.backgroundColor = [UIColor colorWithWhite:1.0 alpha:0.12];
+        self.accountButton.backgroundColor = [UIColor colorWithRed:0.23 green:0.55 blue:1.0 alpha:0.85];
     }
     else if ([license isAuthorized])
     {
         [self.accountButton setTitle:@"账号与卡包（已授权）" forState:UIControlStateNormal];
-        self.accountButton.backgroundColor = [UIColor colorWithRed:0.21 green:0.78 blue:0.35 alpha:0.85];
+        self.accountButton.backgroundColor = [UIColor colorWithRed:0.21 green:0.78 blue:0.35 alpha:0.9];
     }
     else
     {
         [self.accountButton setTitle:@"账号与卡包（待激活）" forState:UIControlStateNormal];
-        self.accountButton.backgroundColor = [UIColor colorWithRed:1.0 green:0.62 blue:0.04 alpha:0.85];
+        self.accountButton.backgroundColor = [UIColor colorWithRed:1.0 green:0.62 blue:0.04 alpha:0.9];
     }
 
     self.statusLabel.text = store.statusText;
