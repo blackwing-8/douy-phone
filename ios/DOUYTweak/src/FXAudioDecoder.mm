@@ -47,8 +47,6 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
     int _framesPerPacket;
 }
 
-- (BOOL)configureWithMagicCookie:(NSData *)cookie sampleRate:(int)sampleRate channels:(int)channels;
-
 - (void)dealloc
 {
     if (_converter)
@@ -252,8 +250,9 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
 
     UInt32 packets = 1;
     OSStatus status = AudioConverterFillComplexBuffer(_converter, FXAACInputProc, &feed, &packets, &outList, NULL);
-    if (status != noErr && status != kAudioConverterErr_NoMoreData)
+    if (status != noErr)
     {
+        // 解码失败就丢掉这一帧（AAPL 不会给 kAudioConverterErr_NoMoreData 这种符号）
         return;
     }
 
