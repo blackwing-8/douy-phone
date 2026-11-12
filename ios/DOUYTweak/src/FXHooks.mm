@@ -93,125 +93,157 @@ static inline void FXMapPixel(size_t x, size_t y, size_t outW, size_t outH,
 }
 
 /*
- * 缩放 + 旋转 + 镜像。
+ * 缩放 + 旋转 + 镜像（查表，纯整数内层循环）。
  *
- * 性能要点：映射在四个旋转角下都是**可分离的**（sx 只依赖 x 或 y，sy 只依赖另一个），
- * 所以每帧只算 dstW + dstH 次，内层循环是纯整数查表。
- * 之前每像素一次浮点除法 + 分支，1080p@60 会把采集线程拖到主线程超时（看门狗杀进程）。
+ * 映射可分离：
+ *   rot 0:   su=u        sv=v
+ *   rot 90:  su=v        sv=1-u
+ *   rot 180: su=1-u      sv=1-v
+ *   rot 270: su=1-v      sv=u
+ * 所以 0/180 是「按行」映射（su 只依赖 x、sv 只依赖 y），
+ * 90/270 是「按列」映射（su 只依赖 y、sv 只依赖 x）。
+ *
+ * 两个分支各自用**尺寸匹配**的表，避免 dstH > dstW（竖屏）时越界 —— 这正是之前
+ * 旋转必崩的原因。
  */
 static void FXConvertPlane(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
                            uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
                            size_t bytesPerPixel, NSInteger rotation, BOOL mirror)
 {
-    if (srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
+    if (src == NULL || dst == NULL || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
     {
         return;
     }
 
     int rot = (int)(((rotation % 360) + 360) % 360);
 
-    // px[i]：第 i 列映射到的源列；py[j]：第 j 行映射到的源行
-    size_t *px = (size_t *)malloc(sizeof(size_t) * dstW);
-    size_t *py = (size_t *)malloc(sizeof(size_t) * dstH);
-    if (px == NULL || py == NULL)
+    if (rot == 0 || rot == 180)
     {
-        free(px);
-        free(py);
+        size_t *sxTab = (size_t *)malloc(sizeof(size_t) * dstW);
+        size_t *syTab = (size_t *)malloc(sizeof(size_t) * dstH);
+        if (sxTab == NULL || syTab == NULL)
+        {
+            free(sxTab);
+            free(syTab);
+            return;
+        }
+
+        for (size_t x = 0; x < dstW; x++)
+        {
+            double u = ((double)x + 0.5) / (double)dstW;
+            double su = (rot == 180) ? (1.0 - u) : u;
+            if (mirror)
+            {
+                su = 1.0 - su;
+            }
+            if (su < 0.0) su = 0.0;
+            if (su > 1.0) su = 1.0;
+            sxTab[x] = (size_t)(su * (double)(srcW - 1));
+        }
+
+        for (size_t y = 0; y < dstH; y++)
+        {
+            double v = ((double)y + 0.5) / (double)dstH;
+            double sv = (rot == 180) ? (1.0 - v) : v;
+            if (sv < 0.0) sv = 0.0;
+            if (sv > 1.0) sv = 1.0;
+            syTab[y] = (size_t)(sv * (double)(srcH - 1));
+        }
+
+        for (size_t y = 0; y < dstH; y++)
+        {
+            const uint8_t *srcRow = src + syTab[y] * srcStride;
+            uint8_t *dstRow = dst + y * dstStride;
+
+            if (bytesPerPixel == 1)
+            {
+                for (size_t x = 0; x < dstW; x++) dstRow[x] = srcRow[sxTab[x]];
+            }
+            else if (bytesPerPixel == 2)
+            {
+                uint16_t *d = (uint16_t *)dstRow;
+                const uint16_t *s = (const uint16_t *)srcRow;
+                for (size_t x = 0; x < dstW; x++) d[x] = s[sxTab[x]];
+            }
+            else
+            {
+                uint32_t *d = (uint32_t *)dstRow;
+                const uint32_t *s = (const uint32_t *)srcRow;
+                for (size_t x = 0; x < dstW; x++) d[x] = s[sxTab[x]];
+            }
+        }
+
+        free(sxTab);
+        free(syTab);
         return;
     }
 
-    for (size_t x = 0; x < dstW; x++)
+    // ---- 90 / 270：按列映射，源的 X 由输出 y 决定，源的 Y 由输出 x 决定 ----
+    size_t *suTab = (size_t *)malloc(sizeof(size_t) * dstH);   // 索引是 y
+    size_t *svTab = (size_t *)malloc(sizeof(size_t) * dstW);   // 索引是 x
+    if (suTab == NULL || svTab == NULL)
     {
-        double u = ((double)x + 0.5) / (double)dstW;
-        double su = u;
-        if (rot == 90)
-        {
-            su = 1.0 - u;          // r=90 时源 X 来自 (1-u)
-        }
-        else if (rot == 180)
-        {
-            su = 1.0 - u;
-        }
-        else if (rot == 270)
-        {
-            su = u;
-        }
+        free(suTab);
+        free(svTab);
+        return;
+    }
+
+    for (size_t y = 0; y < dstH; y++)
+    {
+        double v = ((double)y + 0.5) / (double)dstH;
+        double su = (rot == 90) ? v : (1.0 - v);
         if (mirror)
         {
             su = 1.0 - su;
         }
         if (su < 0.0) su = 0.0;
         if (su > 1.0) su = 1.0;
-        px[x] = (size_t)(su * (double)(srcW - 1));
+        suTab[y] = (size_t)(su * (double)(srcW - 1));
     }
 
-    for (size_t y = 0; y < dstH; y++)
+    for (size_t x = 0; x < dstW; x++)
     {
-        double v = ((double)y + 0.5) / (double)dstH;
-        double sv = v;
-        if (rot == 90)
-        {
-            sv = v;
-        }
-        else if (rot == 180)
-        {
-            sv = 1.0 - v;
-        }
-        else if (rot == 270)
-        {
-            sv = 1.0 - v;
-        }
+        double u = ((double)x + 0.5) / (double)dstW;
+        double sv = (rot == 90) ? (1.0 - u) : u;
         if (sv < 0.0) sv = 0.0;
         if (sv > 1.0) sv = 1.0;
-        py[y] = (size_t)(sv * (double)(srcH - 1));
+        svTab[x] = (size_t)(sv * (double)(srcH - 1));
     }
-
-    // 90/270 时行列表互换
-    BOOL swap = (rot == 90 || rot == 270);
 
     for (size_t y = 0; y < dstH; y++)
     {
-        const uint8_t *srcRow = swap ? (src + px[y] * srcStride) : (src + py[y] * srcStride);
+        size_t sx = suTab[y];
         uint8_t *dstRow = dst + y * dstStride;
 
         if (bytesPerPixel == 1)
         {
             for (size_t x = 0; x < dstW; x++)
             {
-                dstRow[x] = srcRow[swap ? py[x] : px[x]];
+                dstRow[x] = src[svTab[x] * srcStride + sx];
             }
         }
         else if (bytesPerPixel == 2)
         {
             uint16_t *d = (uint16_t *)dstRow;
-            const uint16_t *s = (const uint16_t *)srcRow;
             for (size_t x = 0; x < dstW; x++)
             {
-                d[x] = s[swap ? py[x] : px[x]];
+                d[x] = *(const uint16_t *)(src + svTab[x] * srcStride + sx * 2);
             }
         }
         else
         {
             uint32_t *d = (uint32_t *)dstRow;
-            const uint32_t *s = (const uint32_t *)srcRow;
             for (size_t x = 0; x < dstW; x++)
             {
-                d[x] = s[swap ? py[x] : px[x]];
+                d[x] = *(const uint32_t *)(src + svTab[x] * srcStride + sx * 4);
             }
         }
     }
 
-    free(px);
-    free(py);
+    free(suTab);
+    free(svTab);
 }
 
-/*
- * 旋转 / 镜像 / 缩放到目标尺寸。
- *
- * 注意：这里**故意不用 CoreImage**。CIContext 的同步渲染会和主线程的 CoreAnimation
- * 转场争图形栈的锁，抖音打开摄像头时会导致主线程阻塞 10 秒被看门狗杀掉（0x8BADF00D）。
- * 全部改成纯 CPU 最近邻采样，不碰任何 ObjC 图形对象。
- */
 static CVPixelBufferRef FXTransformBuffer(CVPixelBufferRef source, size_t outWidth, size_t outHeight,
                                           OSType outFormat, NSInteger rotation, BOOL mirror)
 {
@@ -755,6 +787,80 @@ static BOOL FXSafeModeEnabled(void)
 }
 
 /// 把替换帧交给宿主前的最后一道校验：尺寸/格式/时间戳任何一项对不上就放弃替换
+/*
+ * 就地改写麦克风缓冲区（和视频同样的思路：不新建 CMSampleBuffer，只覆盖原始缓冲区）。
+ *
+ * 只有宿主用「16bit 有符号整数 / 48kHz / 2 声道 PCM」时才能这么干：
+ * 字节率一致，覆盖后帧数、时间戳、格式全都不用动。
+ * 其它格式（float32、44.1k、单声道…）直接放弃，并把真实格式打到日志里 —— 不假装能用。
+ */
+static BOOL FXBlitIntoAudioBuffer(CMSampleBufferRef sampleBuffer)
+{
+    FXMediaStore *store = [FXMediaStore shared];
+    if (![store isReplacingAudio])
+    {
+        return NO;
+    }
+
+    CMFormatDescriptionRef format = CMSampleBufferGetFormatDescription(sampleBuffer);
+    const AudioStreamBasicDescription *asbd =
+        format ? CMAudioFormatDescriptionGetStreamBasicDescription(format) : NULL;
+    if (asbd == NULL)
+    {
+        return NO;
+    }
+
+    BOOL compatible =
+        asbd->mFormatID == kAudioFormatLinearPCM &&
+        (asbd->mFormatFlags & kAudioFormatFlagIsSignedInteger) != 0 &&
+        (asbd->mFormatFlags & kAudioFormatFlagIsFloat) == 0 &&
+        asbd->mBitsPerChannel == 16 &&
+        asbd->mChannelsPerFrame == 2 &&
+        (int)asbd->mSampleRate == kFXInputRate;
+
+    if (!compatible)
+    {
+        static dispatch_once_t once;
+        dispatch_once(&once, ^{
+            NSLog(@"[DOUY] 音频替换不可用：宿主格式 fmtID=%u flags=0x%x bits=%u ch=%u rate=%.0f "
+                  @"（只有 16bit/48k/2ch 支持就地替换）",
+                  (unsigned)asbd->mFormatID, (unsigned)asbd->mFormatFlags,
+                  (unsigned)asbd->mBitsPerChannel, (unsigned)asbd->mChannelsPerFrame,
+                  asbd->mSampleRate);
+        });
+        return NO;
+    }
+
+    CMBlockBufferRef block = CMSampleBufferGetDataBuffer(sampleBuffer);
+    if (block == NULL)
+    {
+        return NO;
+    }
+
+    size_t length = 0;
+    char *bytes = NULL;
+    if (CMBlockBufferGetDataPointer(block, 0, NULL, &length, &bytes) != kCMBlockBufferNoErr
+        || bytes == NULL || length == 0)
+    {
+        return NO;
+    }
+
+    NSData *pcm = [store dequeueAudioBytes:length];
+    if (pcm.length == 0)
+    {
+        return NO;
+    }
+
+    size_t copy = pcm.length < length ? pcm.length : length;
+    memcpy(bytes, pcm.bytes, copy);
+    if (copy < length)
+    {
+        memset(bytes + copy, 0, length - copy);   // 不够就补静音
+    }
+
+    return YES;
+}
+
 static BOOL FXVideoSampleLooksValid(CMSampleBufferRef sample)
 {
     if (sample == NULL || !CMSampleBufferIsValid(sample))
@@ -885,40 +991,24 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
         return;
     }
 
-    CMSampleBufferRef replacement = NULL;
-
-    // 音频替换默认关闭：它同样是「新建 CMSampleBuffer 交给宿主」的模式，
-    // 宿主的 CFRelease 所有权语义不同就会 SIGTRAP。需要时用 defaults 打开。
-    BOOL audioReplaceEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"FXEnableAudioReplace"];
-
-    if (audioReplaceEnabled && !FXSafeModeEnabled() && FXAudioReplaceFailures < 5)
+    // 和视频一致：就地覆盖麦克风缓冲区，然后把**原始 sample buffer** 原样转发。
+    // 不再新建/释放任何 CMSampleBuffer（那是 SIGTRAP 的来源）。
+    if (!FXSafeModeEnabled() && FXAudioReplaceFailures < 5)
     {
         @try
         {
-            replacement = FXMakeReplacementAudioSample(sampleBuffer);
+            FXBlitIntoAudioBuffer(sampleBuffer);
         }
         @catch (NSException *exception)
         {
             __sync_add_and_fetch(&FXAudioReplaceFailures, 1);
-            NSLog(@"[DOUY] 音频替换抛异常，回退原帧: %@", exception);
-            replacement = NULL;
-        }
-
-        if (replacement != NULL && !FXAudioSampleLooksValid(replacement))
-        {
-            __sync_add_and_fetch(&FXAudioReplaceFailures, 1);
-            CFRelease(replacement);
-            replacement = NULL;
+            NSLog(@"[DOUY] 音频覆盖异常，本次跳过: %@", exception);
         }
     }
 
     [target captureOutput:output
-        didOutputSampleBuffer:(replacement ?: sampleBuffer)
+        didOutputSampleBuffer:sampleBuffer
                fromConnection:connection];
-    if (replacement)
-    {
-        CFRelease(replacement);
-    }
 }
 
 - (BOOL)respondsToSelector:(SEL)selector
