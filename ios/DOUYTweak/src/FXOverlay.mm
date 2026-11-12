@@ -10,6 +10,16 @@
 #import <UniformTypeIdentifiers/UniformTypeIdentifiers.h>
 #import "FXLicense.h"
 
+// 覆盖层窗口的根控制器绝不允许成为第一响应者：
+// 否则宿主页面转场时 UIKit 会遍历我们的视图树做 first-responder 提升，增加卡死风险。
+@interface FXOverlayRootController : UIViewController
+@end
+
+@implementation FXOverlayRootController
+- (BOOL)canBecomeFirstResponder { return NO; }
+- (BOOL)shouldAutorotate { return NO; }
+@end
+
 @interface FXOverlayWindow : UIWindow
 @end
 
@@ -166,7 +176,7 @@ static const CGFloat kFXPanelWidth = 300.0;
     FXOverlayWindow *window = [[FXOverlayWindow alloc] initWithWindowScene:scene];
     window.windowLevel = UIWindowLevelAlert + 1;
     window.backgroundColor = [UIColor clearColor];
-    window.rootViewController = [[UIViewController alloc] init];
+    window.rootViewController = [[FXOverlayRootController alloc] init];
     window.rootViewController.view.backgroundColor = [UIColor clearColor];
     self.window = window;
 
