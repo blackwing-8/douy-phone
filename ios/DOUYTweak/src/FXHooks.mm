@@ -16,16 +16,6 @@
 
 // ---------------------------------------------------------------- 视频替换
 
-static CIContext *FXSharedCIContext(void)
-{
-    static CIContext *context = nil;
-    static dispatch_once_t once;
-    dispatch_once(&once, ^{
-        context = [CIContext contextWithOptions:@{ kCIContextCacheIntermediates : @NO }];
-    });
-    return context;
-}
-
 /// 按**指定像素格式**建 buffer（必须与摄像头原始帧一致，否则宿主编码器会崩）
 static CVPixelBufferRef FXCreateBufferWithFormat(size_t width, size_t height, OSType format)
 {
@@ -68,7 +58,78 @@ static CVPixelBufferRef FXCreateBufferLike(CVPixelBufferRef like, size_t width, 
     return status == kCVReturnSuccess ? buffer : NULL;
 }
 
-/// 旋转 / 镜像 / 缩放到目标尺寸（只在需要时调用）。
+/// 把目标像素 (x,y) 反算回源像素坐标（含旋转/镜像），全部整数运算。
+static inline void FXMapPixel(size_t x, size_t y, size_t outW, size_t outH,
+                              size_t srcW, size_t srcH, NSInteger rotation, BOOL mirror,
+                              size_t *outX, size_t *outY)
+{
+    // 归一化坐标（像素中心）
+    double u = ((double)x + 0.5) / (double)outW;
+    double v = ((double)y + 0.5) / (double)outH;
+
+    // 逆旋转
+    switch (((rotation % 360) + 360) % 360)
+    {
+        case 90:  { double t = u; u = v;     v = 1.0 - t; break; }
+        case 180: { u = 1.0 - u; v = 1.0 - v; break; }
+        case 270: { double t = u; u = 1.0 - v; v = t;     break; }
+        default:  break;
+    }
+
+    if (mirror)
+    {
+        u = 1.0 - u;
+    }
+
+    if (u < 0.0) u = 0.0;
+    if (u > 1.0) u = 1.0;
+    if (v < 0.0) v = 0.0;
+    if (v > 1.0) v = 1.0;
+
+    size_t sx = (size_t)(u * (double)(srcW - 1));
+    size_t sy = (size_t)(v * (double)(srcH - 1));
+    *outX = sx;
+    *outY = sy;
+}
+
+static void FXConvertPlane(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
+                           uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
+                           size_t bytesPerPixel, NSInteger rotation, BOOL mirror)
+{
+    for (size_t y = 0; y < dstH; y++)
+    {
+        uint8_t *dstRow = dst + y * dstStride;
+        for (size_t x = 0; x < dstW; x++)
+        {
+            size_t sx = 0;
+            size_t sy = 0;
+            FXMapPixel(x, y, dstW, dstH, srcW, srcH, rotation, mirror, &sx, &sy);
+            const uint8_t *srcPixel = src + sy * srcStride + sx * bytesPerPixel;
+
+            // 按像素宽度特化，避免每像素一次 memcpy
+            if (bytesPerPixel == 1)
+            {
+                dstRow[x] = srcPixel[0];
+            }
+            else if (bytesPerPixel == 2)
+            {
+                ((uint16_t *)dstRow)[x] = *(const uint16_t *)srcPixel;
+            }
+            else
+            {
+                ((uint32_t *)dstRow)[x] = *(const uint32_t *)srcPixel;
+            }
+        }
+    }
+}
+
+/*
+ * 旋转 / 镜像 / 缩放到目标尺寸。
+ *
+ * 注意：这里**故意不用 CoreImage**。CIContext 的同步渲染会和主线程的 CoreAnimation
+ * 转场争图形栈的锁，抖音打开摄像头时会导致主线程阻塞 10 秒被看门狗杀掉（0x8BADF00D）。
+ * 全部改成纯 CPU 最近邻采样，不碰任何 ObjC 图形对象。
+ */
 static CVPixelBufferRef FXTransformBuffer(CVPixelBufferRef source, size_t outWidth, size_t outHeight,
                                           OSType outFormat, NSInteger rotation, BOOL mirror)
 {
@@ -83,32 +144,77 @@ static CVPixelBufferRef FXTransformBuffer(CVPixelBufferRef source, size_t outWid
         return NULL;
     }
 
-    CIImage *image = [CIImage imageWithCVPixelBuffer:source];
-    CGFloat width = CVPixelBufferGetWidth(source);
-    CGFloat height = CVPixelBufferGetHeight(source);
-
-    CGAffineTransform transform = CGAffineTransformMakeTranslation(-width / 2.0, -height / 2.0);
-    if (mirror)
+    if (CVPixelBufferLockBaseAddress(source, kCVPixelBufferLock_ReadOnly) != kCVReturnSuccess)
     {
-        transform = CGAffineTransformScale(transform, -1.0, 1.0);
-    }
-    if (rotation != 0)
-    {
-        transform = CGAffineTransformRotate(transform, (CGFloat)rotation * (CGFloat)M_PI / 180.0);
+        CVPixelBufferRelease(destination);
+        return NULL;
     }
 
-    CGRect box = CGRectApplyAffineTransform(CGRectMake(0, 0, width, height), transform);
-    CGFloat boxWidth = MAX(CGRectGetWidth(box), 1.0);
-    CGFloat boxHeight = MAX(CGRectGetHeight(box), 1.0);
-    CGFloat scale = MIN((CGFloat)outWidth / boxWidth, (CGFloat)outHeight / boxHeight);
+    if (CVPixelBufferLockBaseAddress(destination, 0) != kCVReturnSuccess)
+    {
+        CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+        CVPixelBufferRelease(destination);
+        return NULL;
+    }
 
-    CGAffineTransform finalTransform = CGAffineTransformConcat(transform,
-                                                               CGAffineTransformMakeScale(scale, scale));
-    finalTransform = CGAffineTransformConcat(finalTransform,
-                                             CGAffineTransformMakeTranslation(outWidth / 2.0, outHeight / 2.0));
-    CIImage *transformed = [image imageByApplyingTransform:finalTransform];
+    BOOL ok = NO;
+    size_t planeCount = CVPixelBufferGetPlaneCount(source);
 
-    [FXSharedCIContext() render:transformed toCVPixelBuffer:destination];
+    if (planeCount >= 2)
+    {
+        // NV12 / 420f / 420v：Y 平面 + 交错的 UV 平面
+        const uint8_t *srcY = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(source, 0);
+        uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(destination, 0);
+        const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(source, 1);
+        uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(destination, 1);
+
+        if (srcY && dstY && srcUV && dstUV)
+        {
+            size_t srcW = CVPixelBufferGetWidthOfPlane(source, 0);
+            size_t srcH = CVPixelBufferGetHeightOfPlane(source, 0);
+            size_t srcYStride = CVPixelBufferGetBytesPerRowOfPlane(source, 0);
+            size_t dstYStride = CVPixelBufferGetBytesPerRowOfPlane(destination, 0);
+
+            FXConvertPlane(srcY, srcYStride, srcW, srcH,
+                           dstY, dstYStride, outWidth, outHeight,
+                           1, rotation, mirror);
+
+            size_t srcUvW = CVPixelBufferGetWidthOfPlane(source, 1);
+            size_t srcUvH = CVPixelBufferGetHeightOfPlane(source, 1);
+            size_t srcUvStride = CVPixelBufferGetBytesPerRowOfPlane(source, 1);
+            size_t dstUvStride = CVPixelBufferGetBytesPerRowOfPlane(destination, 1);
+
+            FXConvertPlane(srcUV, srcUvStride, srcUvW, srcUvH,
+                           dstUV, dstUvStride, outWidth / 2, outHeight / 2,
+                           2, rotation, mirror);
+            ok = YES;
+        }
+    }
+    else if (planeCount == 0)
+    {
+        // BGRA / 其它 packed 格式
+        const uint8_t *srcP = (const uint8_t *)CVPixelBufferGetBaseAddress(source);
+        uint8_t *dstP = (uint8_t *)CVPixelBufferGetBaseAddress(destination);
+        if (srcP && dstP)
+        {
+            size_t bpp = outFormat == kCVPixelFormatType_32BGRA ? 4 : 4;
+            FXConvertPlane(srcP, CVPixelBufferGetBytesPerRow(source),
+                           CVPixelBufferGetWidth(source), CVPixelBufferGetHeight(source),
+                           dstP, CVPixelBufferGetBytesPerRow(destination),
+                           outWidth, outHeight, bpp, rotation, mirror);
+            ok = YES;
+        }
+    }
+
+    CVPixelBufferUnlockBaseAddress(destination, 0);
+    CVPixelBufferUnlockBaseAddress(source, kCVPixelBufferLock_ReadOnly);
+
+    if (!ok)
+    {
+        CVPixelBufferRelease(destination);
+        return NULL;
+    }
+
     return destination;
 }
 
