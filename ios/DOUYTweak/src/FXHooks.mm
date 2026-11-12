@@ -92,35 +92,117 @@ static inline void FXMapPixel(size_t x, size_t y, size_t outW, size_t outH,
     *outY = sy;
 }
 
+/*
+ * 缩放 + 旋转 + 镜像。
+ *
+ * 性能要点：映射在四个旋转角下都是**可分离的**（sx 只依赖 x 或 y，sy 只依赖另一个），
+ * 所以每帧只算 dstW + dstH 次，内层循环是纯整数查表。
+ * 之前每像素一次浮点除法 + 分支，1080p@60 会把采集线程拖到主线程超时（看门狗杀进程）。
+ */
 static void FXConvertPlane(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
                            uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
                            size_t bytesPerPixel, NSInteger rotation, BOOL mirror)
 {
+    if (srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
+    {
+        return;
+    }
+
+    int rot = (int)(((rotation % 360) + 360) % 360);
+
+    // px[i]：第 i 列映射到的源列；py[j]：第 j 行映射到的源行
+    size_t *px = (size_t *)malloc(sizeof(size_t) * dstW);
+    size_t *py = (size_t *)malloc(sizeof(size_t) * dstH);
+    if (px == NULL || py == NULL)
+    {
+        free(px);
+        free(py);
+        return;
+    }
+
+    for (size_t x = 0; x < dstW; x++)
+    {
+        double u = ((double)x + 0.5) / (double)dstW;
+        double su = u;
+        if (rot == 90)
+        {
+            su = 1.0 - u;          // r=90 时源 X 来自 (1-u)
+        }
+        else if (rot == 180)
+        {
+            su = 1.0 - u;
+        }
+        else if (rot == 270)
+        {
+            su = u;
+        }
+        if (mirror)
+        {
+            su = 1.0 - su;
+        }
+        if (su < 0.0) su = 0.0;
+        if (su > 1.0) su = 1.0;
+        px[x] = (size_t)(su * (double)(srcW - 1));
+    }
+
     for (size_t y = 0; y < dstH; y++)
     {
-        uint8_t *dstRow = dst + y * dstStride;
-        for (size_t x = 0; x < dstW; x++)
+        double v = ((double)y + 0.5) / (double)dstH;
+        double sv = v;
+        if (rot == 90)
         {
-            size_t sx = 0;
-            size_t sy = 0;
-            FXMapPixel(x, y, dstW, dstH, srcW, srcH, rotation, mirror, &sx, &sy);
-            const uint8_t *srcPixel = src + sy * srcStride + sx * bytesPerPixel;
+            sv = v;
+        }
+        else if (rot == 180)
+        {
+            sv = 1.0 - v;
+        }
+        else if (rot == 270)
+        {
+            sv = 1.0 - v;
+        }
+        if (sv < 0.0) sv = 0.0;
+        if (sv > 1.0) sv = 1.0;
+        py[y] = (size_t)(sv * (double)(srcH - 1));
+    }
 
-            // 按像素宽度特化，避免每像素一次 memcpy
-            if (bytesPerPixel == 1)
+    // 90/270 时行列表互换
+    BOOL swap = (rot == 90 || rot == 270);
+
+    for (size_t y = 0; y < dstH; y++)
+    {
+        const uint8_t *srcRow = swap ? (src + px[y] * srcStride) : (src + py[y] * srcStride);
+        uint8_t *dstRow = dst + y * dstStride;
+
+        if (bytesPerPixel == 1)
+        {
+            for (size_t x = 0; x < dstW; x++)
             {
-                dstRow[x] = srcPixel[0];
+                dstRow[x] = srcRow[swap ? py[x] : px[x]];
             }
-            else if (bytesPerPixel == 2)
+        }
+        else if (bytesPerPixel == 2)
+        {
+            uint16_t *d = (uint16_t *)dstRow;
+            const uint16_t *s = (const uint16_t *)srcRow;
+            for (size_t x = 0; x < dstW; x++)
             {
-                ((uint16_t *)dstRow)[x] = *(const uint16_t *)srcPixel;
+                d[x] = s[swap ? py[x] : px[x]];
             }
-            else
+        }
+        else
+        {
+            uint32_t *d = (uint32_t *)dstRow;
+            const uint32_t *s = (const uint32_t *)srcRow;
+            for (size_t x = 0; x < dstW; x++)
             {
-                ((uint32_t *)dstRow)[x] = *(const uint32_t *)srcPixel;
+                d[x] = s[swap ? py[x] : px[x]];
             }
         }
     }
+
+    free(px);
+    free(py);
 }
 
 /*
@@ -560,6 +642,95 @@ static CMSampleBufferRef FXMakeReplacementAudioSample(CMSampleBufferRef original
 
 // ---------------------------------------------------------------- 代理
 
+/*
+ * 就地改写摄像头自己的像素缓冲区。
+ *
+ * 为什么这样做（血泪教训）：
+ *  1) 旧做法是新建一个 CMSampleBuffer 交给宿主 → 宿主按它自己的所有权规则 CFRelease，
+ *     结果释放到非法对象，EXC_BREAKPOINT(SIGTRAP) 直接崩；
+ *  2) 新建 buffer 还要对齐像素格式/尺寸/时间戳，任何一处不一致都会让宿主编码器崩或黑屏。
+ * 改为「覆盖摄像头原始缓冲区、原样转发原始 sample buffer」后：
+ *  不新建任何 CF 对象、不改时间戳、不动格式描述，宿主看到的永远是"它自己的帧"。
+ *
+ * 返回 YES 表示已经写入；NO 表示放弃替换（调用方仍然转发原帧）。
+ */
+static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
+{
+    FXMediaStore *store = [FXMediaStore shared];
+    if (![store isReplacingVideo])
+    {
+        return NO;
+    }
+
+    CVImageBufferRef camera = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (camera == NULL)
+    {
+        return NO;
+    }
+
+    int64_t sourcePts = 0;
+    CVPixelBufferRef decoded = [store copyLatestVideoBufferWithPts:&sourcePts];
+    if (decoded == NULL)
+    {
+        return NO;
+    }
+
+    BOOL done = NO;
+
+    size_t camPlanes = CVPixelBufferGetPlaneCount(camera);
+    size_t srcPlanes = CVPixelBufferGetPlaneCount(decoded);
+
+    if (camPlanes >= 2 && srcPlanes >= 2)
+    {
+        // 摄像头与解码帧都是 NV12 家族（420f/420v 布局一致，只有色彩范围标记不同）
+        if (CVPixelBufferLockBaseAddress(camera, 0) != kCVReturnSuccess)
+        {
+            CVPixelBufferRelease(decoded);
+            return NO;
+        }
+
+        if (CVPixelBufferLockBaseAddress(decoded, kCVPixelBufferLock_ReadOnly) == kCVReturnSuccess)
+        {
+            const uint8_t *srcY = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(decoded, 0);
+            const uint8_t *srcUV = (const uint8_t *)CVPixelBufferGetBaseAddressOfPlane(decoded, 1);
+            uint8_t *dstY = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(camera, 0);
+            uint8_t *dstUV = (uint8_t *)CVPixelBufferGetBaseAddressOfPlane(camera, 1);
+
+            if (srcY && srcUV && dstY && dstUV)
+            {
+                size_t srcW = CVPixelBufferGetWidthOfPlane(decoded, 0);
+                size_t srcH = CVPixelBufferGetHeightOfPlane(decoded, 0);
+                size_t dstW = CVPixelBufferGetWidthOfPlane(camera, 0);
+                size_t dstH = CVPixelBufferGetHeightOfPlane(camera, 0);
+
+                NSInteger rotation = store.rotation;
+                BOOL mirror = store.mirror;
+
+                FXConvertPlane(srcY, CVPixelBufferGetBytesPerRowOfPlane(decoded, 0), srcW, srcH,
+                               dstY, CVPixelBufferGetBytesPerRowOfPlane(camera, 0), dstW, dstH,
+                               1, rotation, mirror);
+
+                FXConvertPlane(srcUV, CVPixelBufferGetBytesPerRowOfPlane(decoded, 1),
+                               CVPixelBufferGetWidthOfPlane(decoded, 1),
+                               CVPixelBufferGetHeightOfPlane(decoded, 1),
+                               dstUV, CVPixelBufferGetBytesPerRowOfPlane(camera, 1),
+                               CVPixelBufferGetWidthOfPlane(camera, 1),
+                               CVPixelBufferGetHeightOfPlane(camera, 1),
+                               2, rotation, mirror);
+                done = YES;
+            }
+
+            CVPixelBufferUnlockBaseAddress(decoded, kCVPixelBufferLock_ReadOnly);
+        }
+
+        CVPixelBufferUnlockBaseAddress(camera, 0);
+    }
+
+    CVPixelBufferRelease(decoded);
+    return done;
+}
+
+
 @interface FXVideoDelegateProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> original;
 @end
@@ -651,38 +822,25 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
         return;
     }
 
-    CMSampleBufferRef replacement = NULL;
-
-    // 安全模式或连续失败 5 次后：只转发原帧，绝不再碰替换链路
+    // 安全模式或连续失败 5 次后：完全不动画面，只转发原帧
     if (!FXSafeModeEnabled() && FXVideoReplaceFailures < 5)
     {
         @try
         {
-            replacement = FXMakeReplacementVideoSample(sampleBuffer, output);
+            // 就地覆盖摄像头缓冲区；随后把**原始 sample buffer** 原样交给宿主，
+            // 全程不新建/不释放任何 CMSampleBuffer 或 CVPixelBuffer。
+            FXBlitIntoCameraBuffer(sampleBuffer);
         }
         @catch (NSException *exception)
         {
             __sync_add_and_fetch(&FXVideoReplaceFailures, 1);
-            NSLog(@"[DOUY] 视频替换抛异常，回退原帧: %@", exception);
-            replacement = NULL;
-        }
-
-        if (replacement != NULL && !FXVideoSampleLooksValid(replacement))
-        {
-            __sync_add_and_fetch(&FXVideoReplaceFailures, 1);
-            NSLog(@"[DOUY] 替换帧校验未通过，回退原帧（第 %d 次）", FXVideoReplaceFailures);
-            CFRelease(replacement);
-            replacement = NULL;
+            NSLog(@"[DOUY] 画面覆盖异常，本次跳过: %@", exception);
         }
     }
 
     [target captureOutput:output
-        didOutputSampleBuffer:(replacement ?: sampleBuffer)
+        didOutputSampleBuffer:sampleBuffer
                fromConnection:connection];
-    if (replacement)
-    {
-        CFRelease(replacement);
-    }
 }
 
 - (void)captureOutput:(AVCaptureOutput *)output didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection
@@ -728,7 +886,12 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
     }
 
     CMSampleBufferRef replacement = NULL;
-    if (!FXSafeModeEnabled() && FXAudioReplaceFailures < 5)
+
+    // 音频替换默认关闭：它同样是「新建 CMSampleBuffer 交给宿主」的模式，
+    // 宿主的 CFRelease 所有权语义不同就会 SIGTRAP。需要时用 defaults 打开。
+    BOOL audioReplaceEnabled = [[NSUserDefaults standardUserDefaults] boolForKey:@"FXEnableAudioReplace"];
+
+    if (audioReplaceEnabled && !FXSafeModeEnabled() && FXAudioReplaceFailures < 5)
     {
         @try
         {
