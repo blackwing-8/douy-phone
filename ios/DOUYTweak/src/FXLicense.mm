@@ -24,9 +24,9 @@ static NSString *const kFXDefaultsBaseURLKey = @"FXLicenseBaseURL";
 
 // 服务端签名公钥（ECDSA P-256，X.509 SPKI 的 base64）。
 // 生成方法：php server/bin/douyctl.php key:gen
-// ⚠️ 这是测试密钥，部署前必须换成你自己 key:gen 出来的那把。
+// V21：已与线上服务端签名密钥对齐（server/keys/server_ec_private.pem 对应的公钥）。
 static NSString *const kFXServerPublicKeyECDSA =
-    @"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJ+vPCM6tFVsKB9N/PXGDHc5yHni/Eu6aDzfrks0CGNqQhS038ccwqXXJePaxttvBdBI17V2iGcBpI7/cbilwQA==";
+    @"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJOfWzhu/MeQgNnMRzDkHLclgX7+rIZQu15ugPqQWnjxXlDh/PSGNA0XS4bOm2ol6/HsoOhe8U/wyESQVd4l+FA==";
 
 static NSString *const kFXKeyId = @"ec-p256-1";
 
