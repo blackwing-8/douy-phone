@@ -46,6 +46,11 @@ extern NSString *const FXStatusDidChangeNotification;
 - (void)setVideoBuffer:(CVPixelBufferRef)buffer ptsMs:(int64_t)ptsMs;
 /// 取最新一帧（CFRetain 过，调用方负责 CFRelease）；无帧返回 NULL。
 - (nullable CVPixelBufferRef)copyLatestVideoBufferWithPts:(int64_t *)outPtsMs;
+
+/// 按先进先出取下一帧（每帧只呈现一次）。队列空返回 NULL。
+/// 用 FIFO 而不是"最新"：相机回调与解码是两个独立时钟，
+/// 取"最新"会导致周期性重复帧/跳帧 —— 30/30 的帧率下画面依然抖。
+- (nullable CVPixelBufferRef)copyNextVideoBufferWithPts:(int64_t *)outPtsMs;
 - (void)invalidateVideo;
 
 // ---- 音频（48kHz / 2ch / int16 交织）----
@@ -61,8 +66,15 @@ extern NSString *const FXStatusDidChangeNotification;
 @end
 
 /// H.264 Annex-B → CVPixelBuffer（VideoToolbox 硬解）。
-@interface FXVideoDecoder : NSObject
+/// 解码回调计数（诊断用：每秒重置一次）
+extern volatile int FXDecodedFrameCounter;
+extern volatile int FXMaxGapMs;
+extern volatile int FXBigGapCount;
+extern volatile int FXCameraDropLate;
+extern volatile int FXCameraDropNoBuffer;
+extern volatile int FXCameraDropOther;
 
+@interface FXVideoDecoder : NSObject
 /// 用 AVCDecoderConfigurationRecord（FLV sequence header）配置。
 - (BOOL)configureWithAVCConfig:(NSData *)avcConfig;
 /// 用 SPS/PPS 原始字节配置。
