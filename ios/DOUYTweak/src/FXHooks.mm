@@ -13,6 +13,7 @@
 #import "FXCommon.h"
 #import <objc/runtime.h>
 #import <CoreImage/CoreImage.h>
+#import <Accelerate/Accelerate.h>
 
 // ---------------------------------------------------------------- 视频替换
 
@@ -106,11 +107,23 @@ static inline void FXMapPixel(size_t x, size_t y, size_t outW, size_t outH,
  * 两个分支各自用**尺寸匹配**的表，避免 dstH > dstW（竖屏）时越界 —— 这正是之前
  * 旋转必崩的原因。
  */
+static BOOL FXScalePlaneFast(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
+                             uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
+                             int bytesPerPixel);
+
 static void FXConvertPlane(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
                            uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
                            size_t bytesPerPixel, NSInteger rotation, BOOL mirror)
 {
     if (src == NULL || dst == NULL || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
+    {
+        return;
+    }
+
+    // 快速路径：不需要旋转/镜像时，交给 memcpy / vImage（SIMD）。
+    // 旧实现即使尺寸完全相同也要做逐像素散列访问，是卡顿的主要来源。
+    if ((((rotation % 360) + 360) % 360) == 0 && !mirror &&
+        FXScalePlaneFast(src, srcStride, srcW, srcH, dst, dstStride, dstW, dstH, (int)bytesPerPixel))
     {
         return;
     }
@@ -686,6 +699,61 @@ static CMSampleBufferRef FXMakeReplacementAudioSample(CMSampleBufferRef original
  *
  * 返回 YES 表示已经写入；NO 表示放弃替换（调用方仍然转发原帧）。
  */
+/*
+ * 把一帧画面搬进摄像头缓冲。
+ *
+ * 旧实现无论尺寸是否相同，都走「逐像素 + 跨行随机读」的标量循环：
+ * 每帧要对 2~3MB 做散列访问，还要锁两个 IOSurface（硬件解码帧在 GPU 内存里，
+ * 锁它等于强制回读）。这就是 USB / 局域网都卡的原因 —— 与网络无关。
+ *
+ * 现在分级处理：
+ *   ① 尺寸相同            → 逐行 memcpy（线性访问，几乎零成本）
+ *   ② 尺寸不同、无旋转镜像 → Accelerate vImage（SIMD 缩放）
+ *   ③ 需要旋转/镜像        → 退回标量实现
+ */
+static BOOL FXScalePlaneFast(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
+                             uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
+                             int bytesPerPixel)
+{
+    if (src == NULL || dst == NULL || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
+    {
+        return NO;
+    }
+
+    if (srcW == dstW && srcH == dstH)
+    {
+        size_t rowBytes = srcW * (size_t)bytesPerPixel;
+        if (rowBytes > srcStride) rowBytes = srcStride;
+        if (rowBytes > dstStride) rowBytes = dstStride;
+        for (size_t y = 0; y < srcH; y++)
+        {
+            memcpy(dst + y * dstStride, src + y * srcStride, rowBytes);
+        }
+        return YES;
+    }
+
+    vImage_Buffer s = { (void *)src, srcH, srcW, srcStride };
+    vImage_Buffer d = { (void *)dst, dstH, dstW, dstStride };
+
+    if (bytesPerPixel == 1)
+    {
+        return vImageScale_Planar8(&s, &d, NULL, kvImageNoFlags) == kvImageNoError;
+    }
+    if (bytesPerPixel == 2)
+    {
+        return vImageScale_CbCr8(&s, &d, NULL, kvImageNoFlags) == kvImageNoError;
+    }
+
+    return NO;
+}
+
+// 诊断：最近一帧的搬运耗时与尺寸（供悬浮窗状态显示）
+static volatile double FXBlitLastMs = 0;
+static volatile int FXBlitCamWidth = 0;
+static volatile int FXBlitCamHeight = 0;
+static volatile int FXBlitSrcWidth = 0;
+static volatile int FXBlitSrcHeight = 0;
+
 static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
 {
     FXMediaStore *store = [FXMediaStore shared];
@@ -694,6 +762,7 @@ static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
         return NO;
     }
 
+    const CFAbsoluteTime blitStart = CFAbsoluteTimeGetCurrent();
     CVImageBufferRef camera = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (camera == NULL)
     {
@@ -758,10 +827,55 @@ static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
         CVPixelBufferUnlockBaseAddress(camera, 0);
     }
 
+    FXBlitSrcWidth = (int)CVPixelBufferGetWidth(decoded);
+    FXBlitSrcHeight = (int)CVPixelBufferGetHeight(decoded);
+    FXBlitCamWidth = (int)CVPixelBufferGetWidth(camera);
+    FXBlitCamHeight = (int)CVPixelBufferGetHeight(camera);
+    FXBlitLastMs = (CFAbsoluteTimeGetCurrent() - blitStart) * 1000.0;
+
     CVPixelBufferRelease(decoded);
     return done;
 }
 
+
+/// 每秒刷新一次诊断信息，便于远端定位卡顿：
+/// 相机回调帧率 / 实际替换帧率 / 单帧搬运耗时 / 源尺寸 → 相机尺寸
+static void FXUpdateDiagStatus(BOOL replaced)
+{
+    static CFAbsoluteTime lastAt = 0;
+    static int camFrames = 0;
+    static int replacedFrames = 0;
+
+    camFrames += 1;
+    if (replaced)
+    {
+        replacedFrames += 1;
+    }
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+    if (lastAt == 0.0)
+    {
+        lastAt = now;
+        return;
+    }
+    if (now - lastAt < 1.0)
+    {
+        return;
+    }
+
+    NSTimeInterval span = now - lastAt;
+    int camFps = (int)(camFrames / span + 0.5);
+    int repFps = (int)(replacedFrames / span + 0.5);
+
+    NSString *text = [NSString stringWithFormat:@"相机%d → 替换%d fps · 搬运%.1fms · 源%dx%d→相机%dx%d",
+                      camFps, repFps, FXBlitLastMs,
+                      FXBlitSrcWidth, FXBlitSrcHeight, FXBlitCamWidth, FXBlitCamHeight];
+    [[FXMediaStore shared] setStatus:text];
+
+    lastAt = now;
+    camFrames = 0;
+    replacedFrames = 0;
+}
 
 @interface FXVideoDelegateProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> original;
@@ -935,7 +1049,8 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
         {
             // 就地覆盖摄像头缓冲区；随后把**原始 sample buffer** 原样交给宿主，
             // 全程不新建/不释放任何 CMSampleBuffer 或 CVPixelBuffer。
-            FXBlitIntoCameraBuffer(sampleBuffer);
+            BOOL replaced = FXBlitIntoCameraBuffer(sampleBuffer);
+            FXUpdateDiagStatus(replaced);
         }
         @catch (NSException *exception)
         {
