@@ -1,6 +1,8 @@
 #import "FXCommon.h"
 #import <VideoToolbox/VideoToolbox.h>
 
+volatile int FXDecodedFrameCounter = 0;
+
 /// Annex-B → AVCC（VideoToolbox 需要 4 字节长度前缀的 NALU 序列）
 static NSData *FXAnnexBToAVCC(NSData *annexB)
 {
@@ -84,6 +86,7 @@ static void FXDecodeCallback(void *decompressionOutputRefCon,
     int64_t ptsMs = (int64_t)llround(CMTimeGetSeconds(presentationTimeStamp) * 1000.0);
     [[FXMediaStore shared] setVideoBuffer:imageBuffer ptsMs:ptsMs];
     [decoder noteDecodedBuffer:imageBuffer];
+      FXDecodedFrameCounter += 1;
 }
 
 @implementation FXVideoDecoder
