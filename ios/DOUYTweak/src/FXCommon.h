@@ -61,8 +61,15 @@ extern NSString *const FXStatusDidChangeNotification;
 @end
 
 /// H.264 Annex-B → CVPixelBuffer（VideoToolbox 硬解）。
-@interface FXVideoDecoder : NSObject
+/// 解码回调计数（诊断用：每秒重置一次）
+extern volatile int FXDecodedFrameCounter;
+extern volatile int FXMaxGapMs;
+extern volatile int FXBigGapCount;
+extern volatile int FXCameraDropLate;
+extern volatile int FXCameraDropNoBuffer;
+extern volatile int FXCameraDropOther;
 
+@interface FXVideoDecoder : NSObject
 /// 用 AVCDecoderConfigurationRecord（FLV sequence header）配置。
 - (BOOL)configureWithAVCConfig:(NSData *)avcConfig;
 /// 用 SPS/PPS 原始字节配置。

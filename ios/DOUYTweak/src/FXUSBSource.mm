@@ -263,6 +263,7 @@ static int64_t FXReadI64(const uint8_t *p) { return (int64_t)((uint64_t)FXReadU3
 
     uint8_t header[kFXHeaderSize];
     BOOL stopping = NO;
+    BOOL playingHintShown = NO;
     while (_running && !stopping)
     {
         if (!FXReadExact(fd, header, kFXHeaderSize, 6000))
@@ -303,6 +304,15 @@ static int64_t FXReadI64(const uint8_t *p) { return (int64_t)((uint64_t)FXReadU3
             {
                 BOOL keyframe = (flags & 0x01) != 0;
                 [video decodeAnnexB:payload ptsMs:ptsMs keyframe:keyframe];
+
+                // 第一次真正解出画面后更新状态，否则界面会一直停在"等待视频参数"
+                if (!playingHintShown && [video lastWidth] > 0)
+                {
+                    playingHintShown = YES;
+                    [[FXMediaStore shared] setStatus:
+                        [NSString stringWithFormat:@"USB 已连接 · 播放中 %dx%d",
+                            [video lastWidth], [video lastHeight]]];
+                }
                 break;
             }
             case FXFrameAudio:
@@ -311,8 +321,18 @@ static int64_t FXReadI64(const uint8_t *p) { return (int64_t)((uint64_t)FXReadU3
                 break;
             }
             case FXFrameConfig:
+            {
+                // ⚠️ 关键修复：USB 路径以前把配置帧直接丢弃，导致 FXVideoDecoder 的
+                // _format 永远为 NULL，decodeAnnexB 首行就 return —— 一帧都解不出来，
+                // 钩子只能放行真实摄像头（表现就是"等待视频参数"+原相机画面）。
+                BOOL ok = [video configureWithAVCConfig:payload];
+                [[FXMediaStore shared] setStatus:
+                    ok ? @"USB 已连接 · 等待画面" : @"USB 视频参数无效"];
+                break;
+            }
             case FXFrameMeta:
             {
+                // 元信息（分辨率/编码）只影响状态显示，真正的解码由 Config 帧初始化
                 break;
             }
             case FXFramePing:
