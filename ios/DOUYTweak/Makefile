@@ -29,7 +29,7 @@ INCLUDES    := -Isrc
 FRAMEWORKS  := -framework Foundation -framework UIKit -framework AVFoundation \
                -framework CoreMedia -framework CoreVideo -framework VideoToolbox \
                -framework AudioToolbox -framework CoreImage -framework CoreGraphics \
-               -framework UniformTypeIdentifiers -framework Security
+               -framework UniformTypeIdentifiers -framework Security -framework Accelerate
 
 LDFLAGS     := -dynamiclib -install_name @executable_path/Frameworks/$(TARGET) -dead_strip
 
