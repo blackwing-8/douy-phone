@@ -13,6 +13,7 @@
 #import "FXCommon.h"
 #import <objc/runtime.h>
 #import <CoreImage/CoreImage.h>
+#import <Accelerate/Accelerate.h>
 
 // ---------------------------------------------------------------- 视频替换
 
@@ -106,11 +107,58 @@ static inline void FXMapPixel(size_t x, size_t y, size_t outW, size_t outH,
  * 两个分支各自用**尺寸匹配**的表，避免 dstH > dstW（竖屏）时越界 —— 这正是之前
  * 旋转必崩的原因。
  */
+static BOOL FXScalePlaneFast(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
+                             uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
+                             int bytesPerPixel);
+
+/*
+ * 纯 90°/270° 旋转的快速路径。
+ *
+ * 映射关系（与下面标量实现一致）：dst(x,y) = src(y, 1-x)，即顺时针旋转。
+ * 只有当尺寸正好互换（不涉及缩放）时才能用 vImage 的旋转，否则返回 NO 走标量。
+ * 这里只处理 Y 平面（占数据量 3/4）；UV 平面只有 1/4，留给标量路径。
+ */
+static BOOL FXRotatePlaneFast(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
+                              uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
+                              int rot)
+{
+    if (srcW != dstH || srcH != dstW)
+    {
+        return NO;
+    }
+
+    vImage_Buffer s = { (void *)src, srcH, srcW, srcStride };
+    vImage_Buffer d = { (void *)dst, dstH, dstW, dstStride };
+
+    if (rot == 90)
+    {
+        return vImageRotate90_Planar8(&s, &d, kRotate90DegreesClockwise, NULL, kvImageNoFlags) == kvImageNoError;
+    }
+
+    return vImageRotate90_Planar8(&s, &d, kRotate270DegreesClockwise, NULL, kvImageNoFlags) == kvImageNoError;
+}
+
 static void FXConvertPlane(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
                            uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
                            size_t bytesPerPixel, NSInteger rotation, BOOL mirror)
 {
     if (src == NULL || dst == NULL || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
+    {
+        return;
+    }
+
+    // 快速路径：不需要旋转/镜像时，交给 memcpy / vImage（SIMD）。
+    // 旧实现即使尺寸完全相同也要做逐像素散列访问，是卡顿的主要来源。
+    if ((((rotation % 360) + 360) % 360) == 0 && !mirror &&
+        FXScalePlaneFast(src, srcStride, srcW, srcH, dst, dstStride, dstW, dstH, (int)bytesPerPixel))
+    {
+        return;
+    }
+
+    // 旋转 90°/270° 且尺寸正好互换：用 vImage 的 NEON 实现（Y 平面）
+    int rotFast = (int)(((rotation % 360) + 360) % 360);
+    if ((rotFast == 90 || rotFast == 270) && !mirror && bytesPerPixel == 1 &&
+        FXRotatePlaneFast(src, srcStride, srcW, srcH, dst, dstStride, dstW, dstH, rotFast))
     {
         return;
     }
@@ -686,6 +734,67 @@ static CMSampleBufferRef FXMakeReplacementAudioSample(CMSampleBufferRef original
  *
  * 返回 YES 表示已经写入；NO 表示放弃替换（调用方仍然转发原帧）。
  */
+/*
+ * 把一帧画面搬进摄像头缓冲。
+ *
+ * 旧实现无论尺寸是否相同，都走「逐像素 + 跨行随机读」的标量循环：
+ * 每帧要对 2~3MB 做散列访问，还要锁两个 IOSurface（硬件解码帧在 GPU 内存里，
+ * 锁它等于强制回读）。这就是 USB / 局域网都卡的原因 —— 与网络无关。
+ *
+ * 现在分级处理：
+ *   ① 尺寸相同            → 逐行 memcpy（线性访问，几乎零成本）
+ *   ② 尺寸不同、无旋转镜像 → Accelerate vImage（SIMD 缩放）
+ *   ③ 需要旋转/镜像        → 退回标量实现
+ */
+static BOOL FXScalePlaneFast(const uint8_t *src, size_t srcStride, size_t srcW, size_t srcH,
+                             uint8_t *dst, size_t dstStride, size_t dstW, size_t dstH,
+                             int bytesPerPixel)
+{
+    if (src == NULL || dst == NULL || srcW == 0 || srcH == 0 || dstW == 0 || dstH == 0)
+    {
+        return NO;
+    }
+
+    if (srcW == dstW && srcH == dstH)
+    {
+        size_t rowBytes = srcW * (size_t)bytesPerPixel;
+        if (rowBytes > srcStride) rowBytes = srcStride;
+        if (rowBytes > dstStride) rowBytes = dstStride;
+        for (size_t y = 0; y < srcH; y++)
+        {
+            memcpy(dst + y * dstStride, src + y * srcStride, rowBytes);
+        }
+        return YES;
+    }
+
+    vImage_Buffer s = { (void *)src, srcH, srcW, srcStride };
+    vImage_Buffer d = { (void *)dst, dstH, dstW, dstStride };
+
+    if (bytesPerPixel == 1)
+    {
+        return vImageScale_Planar8(&s, &d, NULL, kvImageNoFlags) == kvImageNoError;
+    }
+    if (bytesPerPixel == 2)
+    {
+        return vImageScale_CbCr8(&s, &d, NULL, kvImageNoFlags) == kvImageNoError;
+    }
+
+    return NO;
+}
+
+// 诊断：最近一帧的搬运耗时与尺寸（供悬浮窗状态显示）
+static volatile double FXBlitLastMs = 0;
+volatile int FXPresentDup = 0;
+volatile int FXPresentSkip = 0;
+volatile int FXPresentOk = 0;
+volatile int FXCameraGapMaxMs = 0;
+static volatile int64_t FXLastPresentedSeq = 0;
+static volatile double FXCameraLastAtMs = 0;
+static volatile int FXBlitCamWidth = 0;
+static volatile int FXBlitCamHeight = 0;
+static volatile int FXBlitSrcWidth = 0;
+static volatile int FXBlitSrcHeight = 0;
+
 static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
 {
     FXMediaStore *store = [FXMediaStore shared];
@@ -694,6 +803,7 @@ static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
         return NO;
     }
 
+    const CFAbsoluteTime blitStart = CFAbsoluteTimeGetCurrent();
     CVImageBufferRef camera = CMSampleBufferGetImageBuffer(sampleBuffer);
     if (camera == NULL)
     {
@@ -701,7 +811,60 @@ static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
     }
 
     int64_t sourcePts = 0;
-    CVPixelBufferRef decoded = [store copyLatestVideoBufferWithPts:&sourcePts];
+    // 关键：按 FIFO 取下一帧，而不是「最新」。
+    // 相机回调与解码是两个独立时钟，取最新会造成周期性重复/跳帧，
+    // 即使双边都稳定 30fps，画面依然抖。
+    static CVPixelBufferRef lastShown = NULL;
+    int64_t seq = 0;
+    CVPixelBufferRef decoded = [store copyNextVideoBufferWithSequence:&seq];
+    if (decoded != NULL && seq > 0)
+    {
+        int64_t lastSeq = FXLastPresentedSeq;
+        if (lastSeq > 0)
+        {
+            int64_t step = seq - lastSeq;
+            if (step <= 0)
+            {
+                FXPresentDup += 1;      // 同一帧又显示一次
+            }
+            else if (step == 1)
+            {
+                FXPresentOk += 1;       // 正常前进一帧
+            }
+            else
+            {
+                FXPresentSkip += 1;     // 中间被跳过了 (step-1) 帧
+            }
+        }
+        FXLastPresentedSeq = seq;
+    }
+
+    // 兜底 1：队列一时空（解码略慢于相机）→ 用最新帧，避免整帧不替换
+    if (decoded == NULL)
+    {
+        decoded = [store copyLatestVideoBufferWithPts:&sourcePts];
+    }
+
+    // 兜底 2：连最新帧都没有 → 复用上一帧，画面保持而不是回落真实摄像头
+    BOOL held = NO;
+    if (decoded == NULL)
+    {
+        if (lastShown != NULL)
+        {
+            decoded = (CVPixelBufferRef)CFRetain(lastShown);
+            held = YES;
+        }
+    }
+    else
+    {
+        if (lastShown != NULL)
+        {
+            CVPixelBufferRelease(lastShown);
+        }
+        lastShown = (CVPixelBufferRef)CFRetain(decoded);
+    }
+    (void)held;
+
     if (decoded == NULL)
     {
         return NO;
@@ -758,10 +921,93 @@ static BOOL FXBlitIntoCameraBuffer(CMSampleBufferRef sampleBuffer)
         CVPixelBufferUnlockBaseAddress(camera, 0);
     }
 
+    FXBlitSrcWidth = (int)CVPixelBufferGetWidth(decoded);
+    FXBlitSrcHeight = (int)CVPixelBufferGetHeight(decoded);
+    FXBlitCamWidth = (int)CVPixelBufferGetWidth(camera);
+    FXBlitCamHeight = (int)CVPixelBufferGetHeight(camera);
+    FXBlitLastMs = (CFAbsoluteTimeGetCurrent() - blitStart) * 1000.0;
+
     CVPixelBufferRelease(decoded);
     return done;
 }
 
+
+/// 每秒刷新一次诊断信息，便于远端定位卡顿：
+/// 相机回调帧率 / 实际替换帧率 / 单帧搬运耗时 / 源尺寸 → 相机尺寸
+static void FXUpdateDiagStatus(BOOL replaced)
+{
+    // V21：诊断数据默认隐藏，不再覆盖正常状态文案。
+    // 需要排查时：defaults write <宿主BundleId> FXShowStats -bool YES
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"FXShowStats"])
+    {
+        return;
+    }
+
+    static CFAbsoluteTime lastAt = 0;
+    static int camFrames = 0;
+    static int replacedFrames = 0;
+
+    camFrames += 1;
+    if (replaced)
+    {
+        replacedFrames += 1;
+    }
+
+    CFAbsoluteTime now = CFAbsoluteTimeGetCurrent();
+
+    // 相机回调本身的节拍抖动：即使平均 30fps，间隔忽长忽短也会看着卡
+    {
+        double nowMs = now * 1000.0;
+        double prevMs = FXCameraLastAtMs;
+        if (prevMs > 0.0)
+        {
+            int gap = (int)(nowMs - prevMs);
+            if (gap > 0 && gap < 500 && gap > FXCameraGapMaxMs)
+            {
+                FXCameraGapMaxMs = gap;
+            }
+        }
+        FXCameraLastAtMs = nowMs;
+    }
+    if (lastAt == 0.0)
+    {
+        lastAt = now;
+        return;
+    }
+    if (now - lastAt < 1.0)
+    {
+        return;
+    }
+
+    NSTimeInterval span = now - lastAt;
+    int camFps = (int)(camFrames / span + 0.5);
+    int repFps = (int)(replacedFrames / span + 0.5);
+    int decFrames = FXDecodedFrameCounter;
+    FXDecodedFrameCounter = 0;
+    int decFps = (int)(decFrames / span + 0.5);
+
+    NSString *text = [NSString stringWithFormat:
+                        @"相%d 替%d 解%d · 逐帧 好%d/重%d/跳%d · 相机节拍峰%dms · 搬运%.1fms · 丢帧 晚%d/无缓冲%d",
+                        camFps, repFps, decFps,
+                        FXPresentOk, FXPresentDup, FXPresentSkip,
+                        FXCameraGapMaxMs, FXBlitLastMs,
+                        FXCameraDropLate, FXCameraDropNoBuffer];
+      [[FXMediaStore shared] setStatus:text];
+
+      FXMaxGapMs = 0;
+      FXBigGapCount = 0;
+      FXPresentOk = 0;
+      FXPresentDup = 0;
+      FXPresentSkip = 0;
+      FXCameraGapMaxMs = 0;
+      FXCameraDropLate = 0;
+      FXCameraDropNoBuffer = 0;
+      FXCameraDropOther = 0;
+
+    lastAt = now;
+    camFrames = 0;
+    replacedFrames = 0;
+}
 
 @interface FXVideoDelegateProxy : NSObject <AVCaptureVideoDataOutputSampleBufferDelegate>
 @property (nonatomic, weak) id<AVCaptureVideoDataOutputSampleBufferDelegate> original;
@@ -916,7 +1162,167 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
     return YES;
 }
 
+@interface FXVideoDelegateProxy ()
+@property (nonatomic, strong) dispatch_source_t deliveryTimer;
+@property (nonatomic, weak) AVCaptureOutput *deliveryOutput;
+@property (nonatomic, weak) AVCaptureConnection *deliveryConnection;
+@property (nonatomic, assign) size_t camWidth;
+@property (nonatomic, assign) size_t camHeight;
+@property (nonatomic, assign) OSType camFormat;
+@property (nonatomic, assign) BOOL delivered;
+@property (nonatomic, assign) CMTime nextPts;
+@end
+
 @implementation FXVideoDelegateProxy
+
+/// 独立出帧定时器是否已接管：只有「正在替换 + 定时器已出过帧」才算接管
+- (BOOL)deliveryActive
+{
+    return self.deliveryTimer != nil && self.delivered && [[FXMediaStore shared] isReplacingVideo];
+}
+
+- (void)rememberFrame:(CMSampleBufferRef)sampleBuffer
+               output:(AVCaptureOutput *)output
+           connection:(AVCaptureConnection *)connection
+{
+    CVImageBufferRef image = CMSampleBufferGetImageBuffer(sampleBuffer);
+    if (image == NULL)
+    {
+        return;
+    }
+
+    self.camWidth = CVPixelBufferGetWidth(image);
+    self.camHeight = CVPixelBufferGetHeight(image);
+    self.camFormat = CVPixelBufferGetPixelFormatType(image);
+    self.deliveryOutput = output;
+    self.deliveryConnection = connection;
+}
+
+- (void)seedTimelineWithSampleBuffer:(CMSampleBufferRef)sampleBuffer
+{
+    CMTime pts = CMSampleBufferGetPresentationTimeStamp(sampleBuffer);
+    if (CMTIME_IS_VALID(pts))
+    {
+        self.nextPts = pts;
+    }
+}
+
+/*
+ * 宿主相机的帧率（实测 22fps）会成为画面的上限：只在相机回调里替换，
+ * 30fps 的流也只能显示 22 帧 —— 每秒丢 8 帧且不均匀，这就是卡顿。
+ *
+ * 这里起一个 30fps 的串行定时器，主动把最新解码帧投递给宿主，
+ * 出帧节奏与相机回调解耦（帧相用的也是同一思路，见 CADisplayLink / FrameXiangTiming）。
+ * 相机原帧在定时器接管后不再转发，只用来刷新时间轴。
+ */
+- (void)startDeliveryTimer
+{
+    if (self.deliveryTimer != nil)
+    {
+        return;
+    }
+
+    // 默认关闭！从自建线程调用宿主 delegate 会导致宿主在后台/退出时
+    // 碰到已释放对象而崩溃（Aweme 0x8BADF00D 实测）。只有显式打开才启用。
+    if (![[NSUserDefaults standardUserDefaults] boolForKey:@"FXTimerDrive"])
+    {
+        return;
+    }
+
+    dispatch_queue_t queue = dispatch_queue_create("douy.frame.deliver", DISPATCH_QUEUE_SERIAL);
+    dispatch_source_t timer = dispatch_source_create(DISPATCH_SOURCE_TYPE_TIMER, 0, 0, queue);
+    const uint64_t interval = NSEC_PER_SEC / 30;
+    dispatch_source_set_timer(timer,
+                              dispatch_time(DISPATCH_TIME_NOW, (int64_t)interval),
+                              interval,
+                              interval / 8);
+
+    __weak typeof(self) weakSelf = self;
+    dispatch_source_set_event_handler(timer, ^{
+        [weakSelf deliverTick];
+    });
+
+    dispatch_resume(timer);
+    self.deliveryTimer = timer;
+    NSLog(@"[DOUY] 独立出帧定时器已启动（30fps），画面不再受相机 22fps 限制");
+}
+
+- (void)deliverTick
+{
+    @autoreleasepool
+    {
+        FXMediaStore *store = [FXMediaStore shared];
+        if (![store isReplacingVideo])
+        {
+            return;
+        }
+
+        id<AVCaptureVideoDataOutputSampleBufferDelegate> target = self.original;
+        AVCaptureOutput *output = self.deliveryOutput;
+        AVCaptureConnection *connection = self.deliveryConnection;
+        if (target == nil || output == nil || self.camWidth == 0 || self.camHeight == 0)
+        {
+            return;
+        }
+
+        int64_t sourcePts = 0;
+        CVPixelBufferRef decoded = [store copyLatestVideoBufferWithPts:&sourcePts];
+        if (decoded == NULL)
+        {
+            return;
+        }
+
+        CVPixelBufferRef owned = NULL;
+        CVPixelBufferRef usable = decoded;
+        if (CVPixelBufferGetWidth(decoded) != self.camWidth ||
+            CVPixelBufferGetHeight(decoded) != self.camHeight ||
+            CVPixelBufferGetPixelFormatType(decoded) != self.camFormat)
+        {
+            owned = FXTransformBuffer(decoded, self.camWidth, self.camHeight, self.camFormat,
+                                      store.rotation, store.mirror);
+            if (owned == NULL)
+            {
+                CVPixelBufferRelease(decoded);
+                return;
+            }
+            usable = owned;
+        }
+
+        const CMTime step = CMTimeMake(1, 30);
+        CMTime pts = self.nextPts;
+        if (!CMTIME_IS_VALID(pts))
+        {
+            pts = CMTimeMake((int64_t)(CFAbsoluteTimeGetCurrent() * 1000.0), 1000);
+        }
+        pts = CMTimeAdd(pts, step);
+
+        CMSampleBufferRef sample = FXCreateVideoSampleBuffer(usable, pts, step);
+        if (owned)
+        {
+            CVPixelBufferRelease(owned);
+        }
+        CVPixelBufferRelease(decoded);
+
+        if (sample == NULL)
+        {
+            return;
+        }
+
+        self.nextPts = pts;
+        self.delivered = YES;
+        @try
+        {
+            [target captureOutput:output
+                didOutputSampleBuffer:sample
+                       fromConnection:connection];
+        }
+        @catch (NSException *exception)
+        {
+            NSLog(@"[DOUY] 定时出帧异常: %@", exception);
+        }
+        CFRelease(sample);
+    }
+}
 
 - (void)captureOutput:(AVCaptureOutput *)output
     didOutputSampleBuffer:(CMSampleBufferRef)sampleBuffer
@@ -928,6 +1334,7 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
         return;
     }
 
+    BOOL replaced = NO;
     // 安全模式或连续失败 5 次后：完全不动画面，只转发原帧
     if (!FXSafeModeEnabled() && FXVideoReplaceFailures < 5)
     {
@@ -935,13 +1342,38 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
         {
             // 就地覆盖摄像头缓冲区；随后把**原始 sample buffer** 原样交给宿主，
             // 全程不新建/不释放任何 CMSampleBuffer 或 CVPixelBuffer。
-            FXBlitIntoCameraBuffer(sampleBuffer);
+            replaced = FXBlitIntoCameraBuffer(sampleBuffer);
         }
         @catch (NSException *exception)
         {
             __sync_add_and_fetch(&FXVideoReplaceFailures, 1);
             NSLog(@"[DOUY] 画面覆盖异常，本次跳过: %@", exception);
         }
+    }
+
+    // 无论是否替换都统计——用来测「真实摄像头模式下宿主相机本身的帧率」，
+    // 这是判断「22fps 是宿主限制还是我们拖慢」的唯一依据。
+    FXUpdateDiagStatus(replaced);
+
+    // ── 关键改造 ──────────────────────────────────────────────
+    // 宿主相机只有 22fps，而我们的流是 30fps。
+    // 如果只在相机回调里替换，画面永远只能是 22fps —— 每秒丢掉 8 帧且不均匀，
+    // 这就是卡顿的真正原因（与网络、编码、搬运耗时都无关）。
+    //
+    // 对策：记下相机缓冲的几何信息，然后由**独立定时器**按 30fps 主动把最新解码帧
+    // 投递给宿主，不再受相机回调频率限制。相机原帧在定时器工作后就不再转发，
+    // 避免两路帧混在一起。
+    if (replaced)
+    {
+        [self rememberFrame:sampleBuffer output:output connection:connection];
+        [self startDeliveryTimer];
+    }
+
+    if ([self deliveryActive])
+    {
+        // 定时器已接管出帧：只刷新时间轴种子，不转发相机原帧
+        [self seedTimelineWithSampleBuffer:sampleBuffer];
+        return;
     }
 
     [target captureOutput:output
@@ -951,6 +1383,36 @@ static BOOL FXAudioSampleLooksValid(CMSampleBufferRef sample)
 
 - (void)captureOutput:(AVCaptureOutput *)output didDropSampleBuffer:(CMSampleBufferRef)sampleBuffer fromConnection:(AVCaptureConnection *)connection
 {
+    // 按 Apple TN2445：丢帧原因写在 kCMSampleBufferAttachmentKey_DroppedFrameReason 里。
+    // FrameWasLate  = 我们/宿主处理太慢（alwaysDiscardsLateVideoFrames=YES 时丢）
+    // OutOfBuffers  = 缓冲池被占光（有人持有 CMSampleBuffer 太久）
+    // Discontinuity = 采集管道重置
+    if (sampleBuffer != NULL)
+    {
+        CFTypeRef reason = CMGetAttachment(sampleBuffer,
+                                           kCMSampleBufferAttachmentKey_DroppedFrameReason,
+                                           NULL);
+        if (reason != NULL)
+        {
+            if (CFEqual(reason, kCMSampleBufferDroppedFrameReason_FrameWasLate))
+            {
+                __sync_add_and_fetch(&FXCameraDropLate, 1);
+            }
+            else if (CFEqual(reason, kCMSampleBufferDroppedFrameReason_OutOfBuffers))
+            {
+                __sync_add_and_fetch(&FXCameraDropNoBuffer, 1);
+            }
+            else
+            {
+                __sync_add_and_fetch(&FXCameraDropOther, 1);
+            }
+        }
+        else
+        {
+            __sync_add_and_fetch(&FXCameraDropOther, 1);
+        }
+    }
+
     id target = self.original;
     if ([target respondsToSelector:_cmd])
     {
@@ -1059,6 +1521,14 @@ static void FXSwizzle(Class cls, SEL originalSelector, SEL replacementSelector)
     }
 
     [self douy_douy_setSampleBufferDelegate:target queue:sampleBufferCallbackQueue];
+
+    // 实验开关（默认关闭）：alwaysDiscardsLateVideoFrames 为 YES 时，
+    // 委托一旦处理不过来，系统就直接丢帧 —— 相机帧率会被我们自己拖低。
+    // 打开 FXKeepLateFrames 让系统不丢帧，用来验证「22fps 是不是丢帧造成的」。
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"FXKeepLateFrames"])
+    {
+        self.alwaysDiscardsLateVideoFrames = NO;
+    }
 }
 
 - (id<AVCaptureVideoDataOutputSampleBufferDelegate>)douy_douy_sampleBufferDelegate
@@ -1087,6 +1557,7 @@ static void FXSwizzle(Class cls, SEL originalSelector, SEL replacementSelector)
         target = (id<AVCaptureAudioDataOutputSampleBufferDelegate>)proxy;
     }
 
+    FXAudioProbeNoteCaptureHook();
     [self douy_douy_audio_setSampleBufferDelegate:target queue:sampleBufferCallbackQueue];
 }
 
@@ -1098,6 +1569,80 @@ static void FXSwizzle(Class cls, SEL originalSelector, SEL replacementSelector)
         return ((FXAudioDelegateProxy *)delegate).original;
     }
     return delegate;
+}
+
+@end
+
+/*
+ * 宿主相机实测只有 22fps，而我们的流是 30fps —— 只在相机回调里替换，
+ * 画面就永远被锁在 22fps（每秒丢 8 帧且不均匀），这就是卡顿的根源。
+ *
+ * 帧相（FrameXiangTiming）钩的正是 AVCaptureSession 的 addOutput/commitConfiguration/startRunning。
+ * 这里做同一件事：会话启动后把采集帧率顶到 30fps。
+ *
+ * 这条路比「自建定时器投帧」安全得多：宿主仍在自己习惯的采集队列上收帧，
+ * 线程模型完全不变（自建线程那次直接把抖音搞崩了：0x8BADF00D）。
+ */
+static void FXForceDeviceFrameRate(AVCaptureSession *session)
+{
+    if (session == nil || !session.isRunning)
+    {
+        return;
+    }
+    if ([[NSUserDefaults standardUserDefaults] boolForKey:@"FXNoForceFPS"])
+    {
+        return;
+    }
+
+    const CMTime fps = CMTimeMake(1, 30);
+    double appliedFps = 0.0;
+    @try
+    {
+        for (AVCaptureInput *input in session.inputs)
+        {
+            if (![input isKindOfClass:[AVCaptureDeviceInput class]])
+            {
+                continue;
+            }
+
+            AVCaptureDevice *device = ((AVCaptureDeviceInput *)input).device;
+            if (device == nil)
+            {
+                continue;
+            }
+
+            if ([device lockForConfiguration:NULL])
+            {
+                device.activeVideoMinFrameDuration = fps;
+                device.activeVideoMaxFrameDuration = fps;
+                appliedFps = (double)device.activeVideoMinFrameDuration.timescale /
+                             (double)device.activeVideoMinFrameDuration.value;
+                [device unlockForConfiguration];
+            }
+            break;
+        }
+    }
+    @catch (NSException *exception)
+    {
+        NSLog(@"[DOUY] 设置 30fps 失败，保持宿主原设置: %@", exception);
+        return;
+    }
+
+    NSLog(@"[DOUY] 采集帧率已设置为 %.1f fps", appliedFps);
+}
+
+@implementation AVCaptureSession (DOUY)
+
+- (void)douy_douy_startRunning
+{
+    [self douy_douy_startRunning];   // 交换后这里调用的是原实现
+    FXForceDeviceFrameRate(self);
+}
+
+- (void)douy_douy_commitConfiguration
+{
+    [self douy_douy_commitConfiguration];
+    FXForceDeviceFrameRate(self);
 }
 
 @end
@@ -1119,5 +1664,16 @@ void FXInstallHooks(void)
         FXSwizzle([AVCaptureAudioDataOutput class],
                   @selector(sampleBufferDelegate),
                   @selector(douy_douy_audio_sampleBufferDelegate));
+
+        // 音频探针（只记录）
+        FXAudioProbeInstall();
+
+        // 把采集帧率顶到 30fps（与帧相 FrameXiangTiming 同一手法）
+        FXSwizzle([AVCaptureSession class],
+                  @selector(startRunning),
+                  @selector(douy_douy_startRunning));
+        FXSwizzle([AVCaptureSession class],
+                  @selector(commitConfiguration),
+                  @selector(douy_douy_commitConfiguration));
     });
 }
