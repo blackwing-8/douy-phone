@@ -59,6 +59,7 @@ static const CGFloat kFXPanelWidth = 300.0;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *modeButtons;
 @property (nonatomic, strong) UIButton *audioButton;
+@property (nonatomic, strong) UIButton *probeButton;
 @property (nonatomic, strong) UIButton *rotateButton;
 @property (nonatomic, strong) UIButton *mirrorButton;
 @property (nonatomic, strong) UIButton *collapseButton;
@@ -258,7 +259,8 @@ static const CGFloat kFXPanelWidth = 300.0;
     self.rotateButton = [self makeButton:@"旋转 0°" action:@selector(rotateTapped) height:42 fontSize:14];
     self.mirrorButton = [self makeButton:@"镜像：关" action:@selector(mirrorTapped) height:42 fontSize:14];
     self.audioButton = [self makeButton:@"音频替换：关" action:@selector(audioTapped) height:42 fontSize:14];
-    UIStackView *actionRow = [self rowWithButtons:@[ self.rotateButton, self.mirrorButton, self.audioButton ] spacing:8];
+    self.probeButton = [self makeButton:@"音频诊断" action:@selector(probeTapped) height:42 fontSize:14];
+    UIStackView *actionRow = [self rowWithButtons:@[ self.rotateButton, self.mirrorButton, self.audioButton, self.probeButton ] spacing:8];
 
     self.accountButton = [self makeButton:@"账号与卡包" action:@selector(accountTapped) height:48 fontSize:16];
     self.accountButton.backgroundColor = [UIColor colorWithRed:0.23 green:0.55 blue:1.0 alpha:0.85];
@@ -612,6 +614,22 @@ static const CGFloat kFXPanelWidth = 300.0;
     [store setMirror:!store.mirror];
     [store setStatus:store.mirror ? @"镜像：开" : @"镜像：关"];
     [self refreshButtons];
+}
+
+- (void)probeTapped
+{
+    NSString *report = FXAudioProbeReport();
+    UIViewController *presenter = self.window.rootViewController;
+    if (presenter == nil)
+    {
+        return;
+    }
+
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"音频诊断 v3"
+                                                                   message:report
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [presenter presentViewController:alert animated:YES completion:nil];
 }
 
 - (void)audioTapped

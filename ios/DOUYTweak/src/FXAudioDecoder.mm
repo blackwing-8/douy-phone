@@ -260,12 +260,13 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
     if (size >= 4)
     {
         NSData *pcm = [NSData dataWithBytes:output length:size];
-        [[FXMediaStore shared] appendAudio:pcm ptsMs:0];
+    [[FXMediaStore shared] appendAudio:pcm ptsMs:0];
     }
 }
 
 - (void)decodeADTS:(NSData *)adts
 {
+    FXAudioProbeNoteAdtsAttempt();
     if (adts.length <= 7)
     {
         return;
