@@ -24,9 +24,9 @@ static NSString *const kFXDefaultsBaseURLKey = @"FXLicenseBaseURL";
 
 // 服务端签名公钥（ECDSA P-256，X.509 SPKI 的 base64）。
 // 生成方法：php server/bin/douyctl.php key:gen
-// ⚠️ 这是测试密钥，部署前必须换成你自己 key:gen 出来的那把。
+// V21：已与线上服务端签名密钥对齐（server/keys/server_ec_private.pem 对应的公钥）。
 static NSString *const kFXServerPublicKeyECDSA =
-    @"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJ+vPCM6tFVsKB9N/PXGDHc5yHni/Eu6aDzfrks0CGNqQhS038ccwqXXJePaxttvBdBI17V2iGcBpI7/cbilwQA==";
+    @"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJOfWzhu/MeQgNnMRzDkHLclgX7+rIZQu15ugPqQWnjxXlDh/PSGNA0XS4bOm2ol6/HsoOhe8U/wyESQVd4l+FA==";
 
 static NSString *const kFXKeyId = @"ec-p256-1";
 
@@ -41,6 +41,33 @@ static NSString *FXCurrentServerPublicKey(void)
         return override;
     }
     return kFXServerPublicKeyECDSA;
+}
+
+// V21：同时接受多把服务端公钥。不同部署环境的签名密钥可能不同，
+// 以服务端 `php bin/douyctl.php key:show` 打印的为准；任一匹配即通过。
+static NSArray<NSString *> *FXServerPublicKeyCandidates(void)
+{
+    NSMutableArray<NSString *> *keys = [NSMutableArray array];
+
+    NSString *override = [[NSUserDefaults standardUserDefaults] stringForKey:@"FXLicenseServerPublicKey"];
+    if ([override isKindOfClass:[NSString class]] && override.length > 32)
+    {
+        [keys addObject:override];
+    }
+
+    if (kFXServerPublicKeyECDSA.length > 32)
+    {
+        [keys addObject:kFXServerPublicKeyECDSA];
+    }
+
+    // 兼容：旧版内置公钥（部分环境的服务端仍用它签名）
+    NSString *legacy = @"MFkwEwYHKoZIzj0CAQYIKoZIzj0DAQcDQgAEJ+vPCM6tFVsKB9N/PXGDHc5yHni/Eu6aDzfrks0CGNqQhS038ccwqXXJePaxttvBdBI17V2iGcBpI7/cbilwQA==";
+    if (![keys containsObject:legacy])
+    {
+        [keys addObject:legacy];
+    }
+
+    return keys;
 }
 
 /*
@@ -548,6 +575,8 @@ static NSData *FXSignWithDeviceKey(SecKeyRef key, NSData *data)
     NSString *nonce = FXRandomHex(16);
     NSString *bodyHash = FXSHA256Hex(body ?: [NSData data]);
 
+    // 签名串必须与服务端 Proof.php 严格一致（7 段，不含 key_id）。
+    // 之前多拼了一段 kFXKeyId，导致所有鉴权接口验签失败（表现为授权失败/激活失败）。
     NSString *canonical = [NSString stringWithFormat:@"%@\n%@\n%@\n%@\n%@\n%@\n%@\n%@",
                            kFXProofVersion, method, path, timeString, nonce, bodyHash,
                            self.deviceIdentifier ?: @"", kFXKeyId];
@@ -687,40 +716,6 @@ static NSData *FXSignWithDeviceKey(SecKeyRef key, NSData *data)
 
 - (BOOL)verifyServerSignature:(NSString *)signatureBase64 forPayload:(NSString *)payloadBase64
 {
-    NSString *keyB64 = FXCurrentServerPublicKey();
-    if (_serverKey != NULL && ![_serverKeySource isEqualToString:keyB64])
-    {
-        CFRelease(_serverKey);
-        _serverKey = NULL;
-    }
-
-    if (_serverKey == NULL)
-    {
-        NSData *der = FXServerKeyDataFromBase64(keyB64);
-        if (der.length == 0)
-        {
-            NSLog(@"[DOUY] 服务端公钥格式无法识别（应为 SPKI 或 65 字节裸点）");
-            return NO;
-        }
-        NSDictionary *attrs = @{
-            (id)kSecAttrKeyType : (id)kSecAttrKeyTypeECSECPrimeRandom,
-            (id)kSecAttrKeyClass : (id)kSecAttrKeyClassPublic,
-            (id)kSecAttrKeySizeInBits : @256,
-        };
-        CFErrorRef error = NULL;
-        _serverKey = SecKeyCreateWithData((__bridge CFDataRef)der, (__bridge CFDictionaryRef)attrs, &error);
-        _serverKeySource = [keyB64 copy];
-        if (_serverKey == NULL)
-        {
-            if (error != NULL)
-            {
-                NSLog(@"[DOUY] 服务端公钥载入失败: %@", error);
-                CFRelease(error);
-            }
-            return NO;
-        }
-    }
-
     NSData *payload = [[NSData alloc] initWithBase64EncodedString:payloadBase64 options:0];
     NSData *signature = [[NSData alloc] initWithBase64EncodedString:signatureBase64 options:0];
     if (payload.length == 0 || signature.length == 0)
@@ -728,17 +723,63 @@ static NSData *FXSignWithDeviceKey(SecKeyRef key, NSData *data)
         return NO;
     }
 
-    CFErrorRef error = NULL;
-    BOOL ok = SecKeyVerifySignature(_serverKey,
-                                    kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
-                                    (__bridge CFDataRef)payload,
-                                    (__bridge CFDataRef)signature,
-                                    &error) ? YES : NO;
-    if (!ok && error != NULL)
+    NSDictionary *attrs = @{
+        (id)kSecAttrKeyType : (id)kSecAttrKeyTypeECSECPrimeRandom,
+        (id)kSecAttrKeyClass : (id)kSecAttrKeyClassPublic,
+        (id)kSecAttrKeySizeInBits : @256,
+    };
+
+    // 逐个候选公钥尝试：线上服务端的签名密钥以 key:show 为准，
+    // 内置的公钥可能因环境不同而不一致，任一验签通过即可。
+    for (NSString *keyB64 in FXServerPublicKeyCandidates())
     {
-        CFRelease(error);
+        NSData *der = FXServerKeyDataFromBase64(keyB64);
+        if (der.length == 0)
+        {
+            continue;
+        }
+
+        CFErrorRef loadError = NULL;
+        SecKeyRef key = SecKeyCreateWithData((__bridge CFDataRef)der,
+                                             (__bridge CFDictionaryRef)attrs,
+                                             &loadError);
+        if (key == NULL)
+        {
+            if (loadError != NULL)
+            {
+                CFRelease(loadError);
+            }
+            continue;
+        }
+
+        CFErrorRef verifyError = NULL;
+        BOOL ok = SecKeyVerifySignature(key,
+                                        kSecKeyAlgorithmECDSASignatureMessageX962SHA256,
+                                        (__bridge CFDataRef)payload,
+                                        (__bridge CFDataRef)signature,
+                                        &verifyError) ? YES : NO;
+        if (!ok && verifyError != NULL)
+        {
+            CFRelease(verifyError);
+        }
+
+        if (!ok)
+        {
+            CFRelease(key);
+            continue;
+        }
+
+        // 命中：记住这把，后续直接复用
+        if (_serverKey != NULL)
+        {
+            CFRelease(_serverKey);
+        }
+        _serverKey = key;
+        _serverKeySource = [keyB64 copy];
+        return YES;
     }
-    return ok;
+
+    return NO;
 }
 
 // ---------------------------------------------------------------- 状态
