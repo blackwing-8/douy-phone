@@ -1,6 +1,15 @@
 #import "FXCommon.h"
 #import <VideoToolbox/VideoToolbox.h>
 
+volatile int FXDecodedFrameCounter = 0;
+volatile int FXMaxGapMs = 0;
+volatile int FXBigGapCount = 0;
+volatile int FXCameraDropLate = 0;
+volatile int FXCameraDropNoBuffer = 0;
+volatile int FXCameraDropOther = 0;
+
+static volatile double FXLastDecodeAtMs = 0;
+
 /// Annex-B → AVCC（VideoToolbox 需要 4 字节长度前缀的 NALU 序列）
 static NSData *FXAnnexBToAVCC(NSData *annexB)
 {
@@ -84,6 +93,23 @@ static void FXDecodeCallback(void *decompressionOutputRefCon,
     int64_t ptsMs = (int64_t)llround(CMTimeGetSeconds(presentationTimeStamp) * 1000.0);
     [[FXMediaStore shared] setVideoBuffer:imageBuffer ptsMs:ptsMs];
     [decoder noteDecodedBuffer:imageBuffer];
+      FXDecodedFrameCounter += 1;
+
+      // 帧间隔统计：区分「帧率低但均匀」和「有停顿」
+      {
+          double nowMs = CFAbsoluteTimeGetCurrent() * 1000.0;
+          double prevMs = FXLastDecodeAtMs;
+          if (prevMs > 0.0)
+          {
+              int gap = (int)(nowMs - prevMs);
+              if (gap > 0 && gap < 2000)
+              {
+                  if (gap > FXMaxGapMs) FXMaxGapMs = gap;
+                  if (gap > 100) FXBigGapCount += 1;
+              }
+          }
+          FXLastDecodeAtMs = nowMs;
+      }
 }
 
 @implementation FXVideoDecoder
