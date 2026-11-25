@@ -59,6 +59,8 @@ static const CGFloat kFXPanelWidth = 300.0;
 @property (nonatomic, strong) UILabel *statusLabel;
 @property (nonatomic, strong) NSMutableArray<UIButton *> *modeButtons;
 @property (nonatomic, strong) UIButton *audioButton;
+@property (nonatomic, strong) UIButton *speakerButton;
+@property (nonatomic, strong) UIButton *injectButton;
 @property (nonatomic, strong) UIButton *rotateButton;
 @property (nonatomic, strong) UIButton *mirrorButton;
 @property (nonatomic, strong) UIButton *collapseButton;
@@ -258,7 +260,9 @@ static const CGFloat kFXPanelWidth = 300.0;
     self.rotateButton = [self makeButton:@"旋转 0°" action:@selector(rotateTapped) height:42 fontSize:14];
     self.mirrorButton = [self makeButton:@"镜像：关" action:@selector(mirrorTapped) height:42 fontSize:14];
     self.audioButton = [self makeButton:@"音频替换：关" action:@selector(audioTapped) height:42 fontSize:14];
-    UIStackView *actionRow = [self rowWithButtons:@[ self.rotateButton, self.mirrorButton, self.audioButton ] spacing:8];
+    self.speakerButton = [self makeButton:@"声音外放：关" action:@selector(speakerTapped) height:42 fontSize:14];
+    self.injectButton = [self makeButton:@"音频注入诊断" action:@selector(injectTapped) height:42 fontSize:14];
+    UIStackView *actionRow = [self rowWithButtons:@[ self.rotateButton, self.mirrorButton, self.audioButton, self.speakerButton, self.injectButton ] spacing:8];
 
     self.accountButton = [self makeButton:@"账号与卡包" action:@selector(accountTapped) height:48 fontSize:16];
     self.accountButton.backgroundColor = [UIColor colorWithRed:0.23 green:0.55 blue:1.0 alpha:0.85];
@@ -412,6 +416,7 @@ static const CGFloat kFXPanelWidth = 300.0;
     [self.rotateButton setTitle:[NSString stringWithFormat:@"旋转 %ld°", (long)store.rotation] forState:UIControlStateNormal];
     [self.mirrorButton setTitle:store.mirror ? @"镜像：开" : @"镜像：关" forState:UIControlStateNormal];
     [self.audioButton setTitle:store.audioReplaceEnabled ? @"音频替换：开" : @"音频替换：关" forState:UIControlStateNormal];
+    [self.speakerButton setTitle:[FXAudioOut shared].running ? @"声音外放：开" : @"声音外放：关" forState:UIControlStateNormal];
 
     FXLicense *license = [FXLicense shared];
     if (!license.loggedIn)
@@ -611,6 +616,40 @@ static const CGFloat kFXPanelWidth = 300.0;
     FXMediaStore *store = [FXMediaStore shared];
     [store setMirror:!store.mirror];
     [store setStatus:store.mirror ? @"镜像：开" : @"镜像：关"];
+    [self refreshButtons];
+}
+
+- (void)injectTapped
+{
+    FXAudioInjectRetry();
+    NSString *report = FXAudioInjectReport();
+
+    UIViewController *presenter = self.window.rootViewController;
+    if (presenter == nil)
+    {
+        return;
+    }
+    UIAlertController *alert = [UIAlertController alertControllerWithTitle:@"音频注入诊断"
+                                                                   message:report
+                                                            preferredStyle:UIAlertControllerStyleAlert];
+    [alert addAction:[UIAlertAction actionWithTitle:@"关闭" style:UIAlertActionStyleCancel handler:nil]];
+    [presenter presentViewController:alert animated:YES completion:nil];
+}
+
+- (void)speakerTapped
+{
+    FXAudioOut *out = [FXAudioOut shared];
+    if (out.running)
+    {
+        [out stop];
+        [[FXMediaStore shared] setStatus:@"声音外放：关"];
+    }
+    else
+    {
+        BOOL ok = [out start];
+        [[FXMediaStore shared] setStatus:ok ? @"声音外放：开 · 手机扬声器播放 OBS 声音"
+                                            : @"声音外放启动失败（看日志）"];
+    }
     [self refreshButtons];
 }
 
