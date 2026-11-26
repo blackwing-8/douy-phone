@@ -9,7 +9,7 @@
 #import "FXLicense.h"
 #import <UIKit/UIKit.h>
 
-static const char *kFXVersion = "1.0.0";
+static const char *kFXVersion = "V21";
 
 @interface FXPluginBootstrap : NSObject
 @end
