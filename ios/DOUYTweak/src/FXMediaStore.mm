@@ -9,6 +9,10 @@ static const NSUInteger kMaxAudioBytes = 4 * 48000 * 2 * 2;
 {
     NSLock *_lock;
     CVPixelBufferRef _videoBuffer;
+    CVPixelBufferRef _videoQueue[4];
+    int64_t _videoSeqQueue[4];
+    int64_t _videoSeqCounter;   // FIFO 环形缓冲：每帧只呈现一次（纯 C，避免 CF 对象走 ARC 桥接）
+    int _videoQueueCount;
     int64_t _videoPtsMs;
     NSMutableData *_audio;
     int64_t _audioPtsMs;
@@ -54,7 +58,10 @@ static const NSUInteger kMaxAudioBytes = 4 * 48000 * 2 * 2;
 
 - (BOOL)isReplacingAudio
 {
-    return self.mode != FXSourceModeRealCamera && self.audioReplaceEnabled;
+    // 不再排除「真实摄像头」：原版支持「画面用手机后置摄像头、声音用电脑的」。
+    // 缓冲区没数据时会自动放行原始麦克风（FXBlitIntoAudioBuffer 里判断），
+    // 所以放开这个条件不会把真实麦克风弄哑。
+    return self.audioReplaceEnabled;
 }
 
 - (void)setVideoBuffer:(CVPixelBufferRef)buffer ptsMs:(int64_t)ptsMs
@@ -64,17 +71,96 @@ static const NSUInteger kMaxAudioBytes = 4 * 48000 * 2 * 2;
         return;
     }
 
-    CVPixelBufferRef copy = (CVPixelBufferRef)CFRetain(buffer);
+    CVPixelBufferRef dropped = NULL;
+    CVPixelBufferRef oldLatest = NULL;
+
     [_lock lock];
-    CVPixelBufferRef old = _videoBuffer;
-    _videoBuffer = copy;
+
+    // 队列满：丢掉最旧的一帧，保证延迟有上限（≈100ms）
+    if (_videoQueueCount >= 4)
+    {
+        dropped = _videoQueue[0];
+        for (int i = 1; i < _videoQueueCount; i++)
+        {
+            _videoQueue[i - 1] = _videoQueue[i];
+            _videoSeqQueue[i - 1] = _videoSeqQueue[i];
+        }
+        _videoQueueCount -= 1;
+    }
+
+    _videoQueue[_videoQueueCount] = (CVPixelBufferRef)CFRetain(buffer);
+    _videoSeqCounter += 1;
+    _videoSeqQueue[_videoQueueCount] = _videoSeqCounter;
+    _videoQueueCount += 1;
+
+    oldLatest = _videoBuffer;
+    _videoBuffer = (CVPixelBufferRef)CFRetain(buffer);
     _videoPtsMs = ptsMs;
+
     [_lock unlock];
 
-    if (old)
+    if (oldLatest)
     {
-        CVPixelBufferRelease(old);
+        CVPixelBufferRelease(oldLatest);
     }
+    if (dropped)
+    {
+        CVPixelBufferRelease(dropped);
+    }
+}
+
+- (CVPixelBufferRef)copyNextVideoBufferWithSequence:(int64_t *)outSeq
+{
+    CVPixelBufferRef result = NULL;
+    int64_t poppedSeq = 0;
+
+    [_lock lock];
+    if (_videoQueueCount > 0)
+    {
+        result = _videoQueue[0];
+        poppedSeq = _videoSeqQueue[0];
+        for (int i = 1; i < _videoQueueCount; i++)
+        {
+            _videoQueue[i - 1] = _videoQueue[i];
+            _videoSeqQueue[i - 1] = _videoSeqQueue[i];
+        }
+        _videoQueueCount -= 1;
+        _videoQueue[_videoQueueCount] = NULL;
+    }
+    [_lock unlock];
+
+    if (outSeq)
+    {
+        *outSeq = poppedSeq;
+    }
+    return result;
+}
+
+- (CVPixelBufferRef)copyNextVideoBufferWithPts:(int64_t *)outPtsMs
+{
+    CVPixelBufferRef result = NULL;
+    int64_t poppedSeq = 0;
+
+    [_lock lock];
+    if (_videoQueueCount > 0)
+    {
+        result = _videoQueue[0];          // 队列里已持有 +1，直接转移所有权
+        poppedSeq = _videoSeqQueue[0];
+        for (int i = 1; i < _videoQueueCount; i++)
+        {
+            _videoQueue[i - 1] = _videoQueue[i];
+            _videoSeqQueue[i - 1] = _videoSeqQueue[i];
+        }
+        _videoQueueCount -= 1;
+        _videoQueue[_videoQueueCount] = NULL;
+    }
+    if (outPtsMs)
+    {
+        *outPtsMs = _videoPtsMs;
+    }
+    [_lock unlock];
+
+    return result;
 }
 
 - (CVPixelBufferRef)copyLatestVideoBufferWithPts:(int64_t *)outPtsMs
@@ -95,13 +181,32 @@ static const NSUInteger kMaxAudioBytes = 4 * 48000 * 2 * 2;
 
 - (void)invalidateVideo
 {
+    CVPixelBufferRef buffered[4] = {NULL, NULL, NULL, NULL};
+    int bufferedCount = 0;
+    CVPixelBufferRef oldLatest = NULL;
+
     [_lock lock];
-    CVPixelBufferRef old = _videoBuffer;
+    for (int i = 0; i < _videoQueueCount && i < 4; i++)
+    {
+        buffered[bufferedCount++] = _videoQueue[i];
+        _videoQueue[i] = NULL;
+    }
+    _videoQueueCount = 0;
+
+    oldLatest = _videoBuffer;
     _videoBuffer = NULL;
     [_lock unlock];
-    if (old)
+
+    for (int i = 0; i < bufferedCount; i++)
     {
-        CVPixelBufferRelease(old);
+        if (buffered[i])
+        {
+            CVPixelBufferRelease(buffered[i]);
+        }
+    }
+    if (oldLatest)
+    {
+        CVPixelBufferRelease(oldLatest);
     }
 }
 
@@ -126,6 +231,15 @@ static const NSUInteger kMaxAudioBytes = 4 * 48000 * 2 * 2;
         _audioPtsMs += (int64_t)(drop / 4) * 1000 / 48000;
     }
     [_lock unlock];
+}
+
+- (NSUInteger)audioBufferedBytes
+{
+    NSUInteger n = 0;
+    [_lock lock];
+    n = _audio.length;
+    [_lock unlock];
+    return n;
 }
 
 - (NSData *)dequeueAudioBytes:(NSUInteger)maxBytes
