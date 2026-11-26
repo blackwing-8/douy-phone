@@ -45,6 +45,7 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
     int _sampleRate;
     int _channels;
     int _framesPerPacket;
+    int64_t _writtenFrames;   // 累计已输出帧数，用来生成正确 PTS
 }
 
 - (void)dealloc
@@ -68,6 +69,7 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
 
 - (void)reset
 {
+    _writtenFrames = 0;
     if (_converter)
     {
         AudioConverterDispose(_converter);
@@ -201,10 +203,13 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
     output.mBytesPerFrame = (UInt32)(kOutputChannels * 2);
     output.mBytesPerPacket = output.mBytesPerFrame;
 
+    FXStatsConfigCall();
+
     OSStatus status = AudioConverterNew(&input, &output, &_converter);
     if (status != noErr || _converter == NULL)
     {
         _converter = NULL;
+        FXStatsConfigResult(NO, (int32_t)status);
         return NO;
     }
 
@@ -225,6 +230,7 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
     _sampleRate = sampleRate;
     _channels = channels;
     _framesPerPacket = 1024;
+    FXStatsConfigResult(YES, 0);
     return YES;
 }
 
@@ -241,27 +247,68 @@ static OSStatus FXAACInputProc(AudioConverterRef converter,
     feed.channels = (UInt32)_channels;
     feed.consumed = NO;
 
-    uint8_t output[16 * 1024];
-    AudioBufferList outList = { 0 };
-    outList.mNumberBuffers = 1;
-    outList.mBuffers[0].mNumberChannels = (UInt32)kOutputChannels;
-    outList.mBuffers[0].mDataByteSize = sizeof(output);
-    outList.mBuffers[0].mData = output;
+    // 关键修复（2026-11-26）：以前写死 packets = 1。
+    // 输出 ASBD 是 16bit PCM，mFramesPerPacket = 1，所以「1 个输出包」=
+    // 1 个采样点 = 4 字节；一帧 AAC 本该解出 1024 个采样点（约 4096 字节）。
+    // 结果每秒只攒一百多字节，缓冲永远凑不满 → 听感就是完全没声音。
+    // 现在：一次要满缓冲能装下的帧数，并循环取完转换器剩余样本。
+    static const size_t kOutBytesPerFrame = (size_t)kOutputChannels * sizeof(int16_t);
+    uint8_t output[8 * 1024];   // 8192 字节 = 2048 帧，足够一帧 AAC(1024)
+    const UInt32 maxFrames = (UInt32)(sizeof(output) / kOutBytesPerFrame);
 
-    UInt32 packets = 1;
-    OSStatus status = AudioConverterFillComplexBuffer(_converter, FXAACInputProc, &feed, &packets, &outList, NULL);
-    if (status != noErr)
+    NSUInteger total = 0;
+    int guard = 0;
+
+    while (guard++ < 4)
     {
-        // 解码失败就丢掉这一帧（AAPL 不会给 kAudioConverterErr_NoMoreData 这种符号）
+        feed.consumed = NO;
+
+        AudioBufferList outList = { 0 };
+        outList.mNumberBuffers = 1;
+        outList.mBuffers[0].mNumberChannels = (UInt32)kOutputChannels;
+        outList.mBuffers[0].mDataByteSize = (UInt32)(sizeof(output) - total);
+        outList.mBuffers[0].mData = output + total;
+
+        UInt32 packets = maxFrames - (UInt32)(total / kOutBytesPerFrame);
+        if (packets == 0)
+        {
+            break;
+        }
+
+        OSStatus status = AudioConverterFillComplexBuffer(_converter, FXAACInputProc, &feed,
+                                                          &packets, &outList, NULL);
+        if (status != noErr)
+        {
+            break;
+        }
+
+        if (outList.mBuffers[0].mDataByteSize == 0)
+        {
+            break;
+        }
+
+        total += outList.mBuffers[0].mDataByteSize;
+
+        if (packets == 0 || total >= sizeof(output))
+        {
+            break;
+        }
+    }
+
+    if (total < kOutBytesPerFrame)
+    {
+        FXStatsDecodeResult(NO, -1, 0);
         return;
     }
 
-    UInt32 size = outList.mBuffers[0].mDataByteSize;
-    if (size >= 4)
-    {
-        NSData *pcm = [NSData dataWithBytes:output length:size];
-        [[FXMediaStore shared] appendAudio:pcm ptsMs:0];
-    }
+    NSData *pcm = [NSData dataWithBytes:output length:total];
+    const int64_t frames = (int64_t)(total / kOutBytesPerFrame);
+    const int64_t rate = (int64_t)(_sampleRate > 0 ? _sampleRate : kOutputSampleRate);
+    const int64_t ptsMs = (_writtenFrames * 1000) / rate;
+    _writtenFrames += frames;
+
+    FXStatsDecodeResult(YES, 0, total);
+    [[FXMediaStore shared] appendAudio:pcm ptsMs:ptsMs];
 }
 
 - (void)decodeADTS:(NSData *)adts

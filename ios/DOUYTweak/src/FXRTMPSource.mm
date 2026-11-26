@@ -92,6 +92,7 @@
 
 - (void)rtmpClient:(FXRtmpClient *)client didReceiveAudioAac:(NSData *)rawAac ptsMs:(int64_t)ptsMs
 {
+    FXStatsRtmpAudio(rawAac.length);
     [_audio decodeRawAAC:rawAac];
 }
 
