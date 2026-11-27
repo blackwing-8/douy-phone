@@ -1,12 +1,14 @@
 //
 //  FXPlugin.mm —— 插件入口
 //
-//  由注入器把 DOUY.dylib 塞进目标 App 的 Mach-O（LC_LOAD_DYLIB），
-//  启动时 dyld 会跑到这里的 constructor：装 hook + 挂浮窗 + 启动授权核验。
+//  注入器把 Yuancam.dylib 塞进目标 App（LC_LOAD_DYLIB），
+//  启动时 dyld 执行这里的 constructor：装拍照钩子 + 挂浮窗。
+//
+//  注意：constructor 里只做「装钩子 + 排一次主线程任务」，
+//        不扫内存、不改代码页 —— 任何失败都只是"没生效"。
 //
 
 #import "FXCommon.h"
-#import "FXLicense.h"
 #import <UIKit/UIKit.h>
 
 static const char *kFXVersion = "1.0.0";
@@ -26,13 +28,11 @@ static const char *kFXVersion = "1.0.0";
             {
                 continue;
             }
-
             if (scene.activationState != UISceneActivationStateForegroundActive &&
                 scene.activationState != UISceneActivationStateForegroundInactive)
             {
                 continue;
             }
-
             FXAttachOverlayToScene((UIWindowScene *)scene);
             return;
         }
@@ -46,13 +46,12 @@ static void FXPluginInitialize(void)
 {
     @autoreleasepool
     {
-        NSLog(@"[DOUY] Plugin %s loaded (iOS / arm64)", kFXVersion);
+        NSLog(@"[原相机替换] plugin loaded %s", kFXVersion);
 
-        FXInstallHooks();
+        // 1) 装拍照钩子（只接管数据出口）
+        FXInstallPhotoHooks();
 
-        // 授权：生成/读取设备身份，有本地会话就立刻联网核验
-        [[FXLicense shared] bootstrap];
-
+        // 2) 浮窗挂载：等 App 起来再挂
         dispatch_async(dispatch_get_main_queue(), ^{
             NSNotificationCenter *center = [NSNotificationCenter defaultCenter];
 
@@ -60,45 +59,17 @@ static void FXPluginInitialize(void)
                                 object:nil
                                  queue:[NSOperationQueue mainQueue]
                             usingBlock:^(NSNotification *note) {
-                                [FXPluginBootstrap attachToActiveScene];
-                            }];
+                [FXPluginBootstrap attachToActiveScene];
+            }];
 
-            [center addObserverForName:UISceneDidActivateNotification
+            [center addObserverForName:UIApplicationDidBecomeActiveNotification
                                 object:nil
                                  queue:[NSOperationQueue mainQueue]
                             usingBlock:^(NSNotification *note) {
-                                if ([note.object isKindOfClass:[UIWindowScene class]])
-                                {
-                                    FXAttachOverlayToScene((UIWindowScene *)note.object);
-                                }
-                            }];
+                [FXPluginBootstrap attachToActiveScene];
+            }];
 
-            // 授权状态变化：失效则立刻恢复真实摄像头，避免"白用"
-            [center addObserverForName:FXLicenseDidChangeNotification
-                                object:nil
-                                 queue:[NSOperationQueue mainQueue]
-                            usingBlock:^(NSNotification *note) {
-                                FXLicense *license = [FXLicense shared];
-                                FXMediaStore *store = [FXMediaStore shared];
-                                if (![license isAuthorized] && store.mode != FXSourceModeRealCamera)
-                                {
-                                    store.mode = FXSourceModeRealCamera;
-                                    [store invalidateVideo];
-                                    [store resetAudio];
-                                    [store setStatus:license.statusText];
-                                }
-                                else if ([license isAuthorized] && license.statusText.length > 0)
-                                {
-                                    [store setStatus:license.statusText];
-                                }
-                            }];
-
-            [center addObserverForName:UIApplicationDidEnterBackgroundNotification
-                                object:nil
-                                 queue:[NSOperationQueue mainQueue]
-                            usingBlock:^(NSNotification *note) {
-                                NSLog(@"[DOUY] entered background");
-                            }];
+            [FXPluginBootstrap attachToActiveScene];
         });
     }
 }
