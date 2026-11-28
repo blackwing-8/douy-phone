@@ -1,16 +1,18 @@
 #
-#  兜鱼复刻版 · iOS 注入插件
+#  原相机替换 · iOS 注入插件
 #
-#  在 macOS（GitHub Actions 的 macos-14 runner 也可）直接编译出 arm64 的 dylib，
+#  拍照替换：让宿主 App 拍照时拿到我们指定的图片（本地 / USB / 局域网）。
+#
+#  在 macOS（或 GitHub Actions 的 macos-14 runner）直接编译出 arm64 dylib，
 #  不需要 Theos：只用 Xcode 自带的 clang + iPhoneOS SDK。
 #
 #  用法：
 #      make            # 编译 + ad-hoc 签名
 #      make clean
-#      make info       # 打印产物 Mach-O 信息（验证用）
+#      make info       # 打印产物 Mach-O 信息
 #
 
-TARGET      := DOUY.dylib
+TARGET      := Yuancam.dylib
 BUILD_DIR   := build
 SRC         := $(wildcard src/*.mm)
 OBJ         := $(patsubst src/%.mm,$(BUILD_DIR)/%.o,$(SRC))
@@ -27,9 +29,8 @@ FLAGS       := $(ARCH) $(MIN_IOS) -isysroot $(SDK) \
 INCLUDES    := -Isrc
 
 FRAMEWORKS  := -framework Foundation -framework UIKit -framework AVFoundation \
-               -framework CoreMedia -framework CoreVideo -framework VideoToolbox \
-               -framework AudioToolbox -framework CoreImage -framework CoreGraphics \
-               -framework UniformTypeIdentifiers -framework Security
+               -framework CoreMedia -framework CoreGraphics -framework CoreImage \
+               -framework ImageIO -framework UniformTypeIdentifiers
 
 LDFLAGS     := -dynamiclib -install_name @executable_path/Frameworks/$(TARGET) -dead_strip
 
@@ -51,13 +52,12 @@ $(TARGET): $(OBJ)
 	$(CXX) $(FLAGS) $(LDFLAGS) $(OBJ) $(FRAMEWORKS) -o $@
 	@echo "==> built $(TARGET) ($$(wc -c < $(TARGET) | tr -d ' ') bytes)"
 	codesign --force --sign - --timestamp=none $@ && echo "==> ad-hoc signed" || echo "!! codesign 失败（注入器通常会自己重签）"
+	@# CI 兼容：现有 workflow 固定找 DOUY.dylib，这里给一份同名副本
+	@cp -f $(TARGET) DOUY.dylib && echo "==> 已生成 CI 兼容副本 DOUY.dylib"
 
 info: $(TARGET)
 	@file $(TARGET)
-	@otool -hv $(TARGET)
 	@otool -L $(TARGET)
-	@echo "--- load command（注入时需要一条 LC_LOAD_DYLIB）---"
-	@otool -l $(TARGET) | grep -A2 LC_LOAD_DYLIB | head -20
 
 clean:
 	@rm -rf $(BUILD_DIR) $(TARGET)
